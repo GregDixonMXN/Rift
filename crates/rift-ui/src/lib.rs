@@ -189,7 +189,7 @@ pub fn run_native(cs: ChangeSet) -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        &title,
+        "rift",
         options,
         Box::new(|cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
@@ -249,7 +249,7 @@ pub fn run_native_progressive(
         ..Default::default()
     };
     eframe::run_native(
-        &title,
+        "rift",
         options,
         Box::new(|cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());

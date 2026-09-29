@@ -19,11 +19,22 @@ carries evidence you can drill into.
 
     crates/rift-core      ChangeSet model: files, symbols, evidence, review items
     crates/rift-git       git2-backed diff extraction (worktree/staged/commit/range)
-    crates/rift-parser    syn (Rust) + tree-sitter (TS/JS) + regex fallback
+    crates/rift-parser    syn (Rust) + tree-sitter (TS/JS/Python/Go/C#) + regex fallback
     crates/rift-analysis  deterministic importance scoring + review grouping
     crates/rift-cli       `rift` binary
     crates/rift-ui        eframe/egui native UI (Overview/Queue/Files/Diff)
     docs/                 architecture notes
+
+## Install
+
+    cargo install --path crates/rift-cli
+
+Puts `rift` on PATH (`~/.cargo/bin`). Then from any repo:
+
+    cd <your-repo> && rift
+
+Rift needs a git repository to read. Point it at one (`rift <path>`) or
+start tracking (`git init && git add -A && git commit -m init`).
 
 ## Build
 

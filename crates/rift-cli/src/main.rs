@@ -5,7 +5,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use rift_core::ChangeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -69,8 +69,7 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
-    let engine = rift_git::GitEngine::discover(&args.path)
-        .with_context(|| format!("could not open repository at {}", args.path.display()))?;
+    let engine = open_repo(&args.path)?;
     let root = engine.root.to_string_lossy().replace('\\', "/");
     let (files, base_ref, head_ref) = resolve_files(&engine, &args)?;
     // GUI first; fall back to text when headless.
@@ -86,8 +85,7 @@ fn main() -> Result<()> {
 }
 
 fn build_changeset(args: &Args) -> Result<ChangeSet> {
-    let engine = rift_git::GitEngine::discover(&args.path)
-        .with_context(|| format!("could not open repository at {}", args.path.display()))?;
+    let engine = open_repo(&args.path)?;
     let root = engine.root.to_string_lossy().replace('\\', "/");
 
     let (mut files, base_ref, head_ref) = resolve_files(&engine, args)?;
@@ -104,6 +102,26 @@ fn build_changeset(args: &Args) -> Result<ChangeSet> {
     };
     rift_analysis::fill_stats(&mut cs);
     Ok(cs)
+}
+
+/// Open a repo with a human error when PATH isn't in one. First-run
+/// stumble, so it says what to do instead of dumping libgit2 codes.
+fn open_repo(path: &Path) -> Result<rift_git::GitEngine> {
+    match rift_git::GitEngine::discover(path) {
+        Ok(engine) => Ok(engine),
+        Err(err) => {
+            let not_repo = err.chain().any(|c| {
+                c.to_string().contains("NotFound") || c.to_string().contains("not a git repository")
+            });
+            if not_repo {
+                return Err(anyhow::anyhow!(
+                    "'{}' is not inside a git repository.\n\nrift reviews git changes, so it needs a repo to read:\n  inside a project:  cd <repo> && rift\n  start tracking:    cd <dir> && git init && git add -A && git commit -m init\n  point at one:      rift <path-to-repo>",
+                    path.display()
+                ));
+            }
+            Err(err).with_context(|| format!("could not open repository at {}", path.display()))
+        }
+    }
 }
 
 /// Git file list + ref labels, without any symbol analysis.
