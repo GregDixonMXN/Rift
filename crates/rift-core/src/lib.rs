@@ -120,30 +120,41 @@ impl FileChange {
         }
     }
 
-    /// Heuristic: whitespace/blank-only diff => formatting-only candidate.
+    /// Formatting-only heuristic: compare whitespace-stripped line multisets.
+    /// Indentation or brace reflow yields identical multisets; any token
+    /// change (including comments) does not. Pure add/delete is never
+    /// formatting-only.
     pub fn looks_formatting_only(&self) -> bool {
         if self.hunks.is_empty() {
             return false;
         }
-        let mut meaningful = 0;
+        let mut del = Vec::new();
+        let mut add = Vec::new();
         for h in &self.hunks {
             for l in &h.lines {
-                if matches!(l.kind, DiffLineKind::Context) {
-                    continue;
+                match l.kind {
+                    DiffLineKind::Context => {}
+                    DiffLineKind::Addition => {
+                        let t: String = l.text.chars().filter(|c| !c.is_whitespace()).collect();
+                        if !t.is_empty() {
+                            add.push(t);
+                        }
+                    }
+                    DiffLineKind::Deletion => {
+                        let t: String = l.text.chars().filter(|c| !c.is_whitespace()).collect();
+                        if !t.is_empty() {
+                            del.push(t);
+                        }
+                    }
                 }
-                let t: String = l.text.chars().filter(|c| !c.is_whitespace()).collect();
-                if t.is_empty() {
-                    continue;
-                }
-                // Strip punctuation-only lines (braces, commas, parens).
-                let alnum: String = t.chars().filter(|c| c.is_alphanumeric()).collect();
-                if alnum.is_empty() {
-                    continue;
-                }
-                meaningful += 1;
             }
         }
-        meaningful == 0 && (self.added_lines + self.deleted_lines) > 0
+        if del.is_empty() || add.is_empty() {
+            return false;
+        }
+        del.sort();
+        add.sort();
+        del == add
     }
 }
 

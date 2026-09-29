@@ -50,7 +50,10 @@ impl GitEngine {
             .diff_tree_to_workdir_with_index(head.as_ref(), Some(&mut opts))
             .context("diff HEAD -> workdir failed")?;
 
-        let mut files = diff_to_files(&mut diff, &self.root, &self.repo)?;
+        let mut files = diff_to_files(&mut diff)?;
+        for f in files.iter_mut() {
+            fill_worktree_contents(&self.repo, &self.root, f);
+        }
 
         if include_untracked {
             files.extend(self.untracked_files()?);
@@ -66,7 +69,9 @@ impl GitEngine {
             .repo
             .diff_tree_to_index(head.as_ref(), None, Some(&mut opts))
             .context("diff HEAD -> index failed")?;
-        diff_to_files(&mut diff, &self.root, &self.repo)
+        let mut files = diff_to_files(&mut diff)?;
+        self.fill_staged_contents(&mut files);
+        Ok(files)
     }
 
     /// Single commit vs its first parent (or empty tree for root commit).
@@ -84,11 +89,9 @@ impl GitEngine {
             .repo
             .diff_tree_to_tree(old_tree.as_ref(), Some(&new_tree), Some(&mut opts))
             .context("commit diff failed")?;
-        let mut files = diff_to_files(&mut diff, &self.root, &self.repo)?;
+        let mut files = diff_to_files(&mut diff)?;
         // Populate content from git objects for commit diffs.
-        for f in files.iter_mut() {
-            let _ = fill_commit_contents(&self.repo, &commit, f);
-        }
+        fill_tree_contents(&self.repo, old_tree.as_ref(), Some(&new_tree), &mut files);
         Ok(files)
     }
 
@@ -110,7 +113,38 @@ impl GitEngine {
             .repo
             .diff_tree_to_tree(Some(&base_tree), Some(&head_tree), Some(&mut opts))
             .context("range diff failed")?;
-        diff_to_files(&mut diff, &self.root, &self.repo)
+        let mut files = diff_to_files(&mut diff)?;
+        fill_tree_contents(&self.repo, Some(&base_tree), Some(&head_tree), &mut files);
+        Ok(files)
+    }
+
+    /// Staged (index vs HEAD) contents: old from HEAD tree, new from index blob.
+    fn fill_staged_contents(&self, files: &mut [FileChange]) {
+        let head_tree = self.repo.head().ok().and_then(|h| h.peel_to_tree().ok());
+        let index = self.repo.index().ok();
+        for fc in files.iter_mut() {
+            if fc.is_binary {
+                continue;
+            }
+            if !matches!(fc.status, FileStatus::Added) && !fc.old_path.is_empty() {
+                if let Some(t) = head_tree.as_ref() {
+                    fc.old_content = blob_text(&self.repo, t, &fc.old_path, &mut fc.is_binary);
+                }
+            }
+            if !matches!(fc.status, FileStatus::Deleted) && !fc.new_path.is_empty() {
+                if let Some(idx) = index.as_ref() {
+                    if let Some(entry) = idx.get_path(Path::new(&fc.new_path), 0) {
+                        if let Ok(blob) = self.repo.find_blob(entry.id) {
+                            if blob.is_binary() {
+                                fc.is_binary = true;
+                            } else if blob.size() <= MAX_CONTENT_BYTES as usize {
+                                fc.new_content = String::from_utf8(blob.content().to_vec()).ok();
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn untracked_files(&self) -> Result<Vec<FileChange>> {
@@ -223,7 +257,7 @@ fn flush_pending(cur: &mut Option<Pending>, ordered: &mut Vec<Pending>) {
     }
 }
 
-fn diff_to_files(diff: &mut git2::Diff, root: &Path, repo: &Repository) -> Result<Vec<FileChange>> {
+fn diff_to_files(diff: &mut git2::Diff) -> Result<Vec<FileChange>> {
     // Rename/copy detection (similarity-based, replaces DiffOptions flags).
     {
         let mut find_opts = git2::DiffFindOptions::new();
@@ -365,7 +399,7 @@ fn diff_to_files(diff: &mut git2::Diff, root: &Path, repo: &Repository) -> Resul
             p.old_path.clone()
         };
         let language = Language::from_path(&display);
-        let mut fc = FileChange {
+        let fc = FileChange {
             old_path: p.old_path,
             new_path: p.new_path,
             status: p.status,
@@ -379,7 +413,6 @@ fn diff_to_files(diff: &mut git2::Diff, root: &Path, repo: &Repository) -> Resul
             old_content: None,
             new_content: None,
         };
-        fill_worktree_contents(repo, root, &mut fc);
         out.push(fc);
     }
     Ok(out)
@@ -418,47 +451,49 @@ fn fill_worktree_contents(repo: &Repository, root: &Path, fc: &mut FileChange) {
     }
 }
 
-fn fill_commit_contents(
+/// Read one blob from a tree as text. Returns None for missing, oversized,
+/// binary, or non-UTF8 blobs (marks binary via the `is_binary` out-flag).
+fn blob_text(
     repo: &Repository,
-    commit: &git2::Commit,
-    fc: &mut FileChange,
-) -> Result<()> {
-    if fc.is_binary {
-        return Ok(());
+    tree: &git2::Tree,
+    path: &str,
+    is_binary: &mut bool,
+) -> Option<String> {
+    let entry = tree.get_path(Path::new(path)).ok()?;
+    let obj = entry.to_object(repo).ok()?;
+    let blob = obj.as_blob()?;
+    if blob.is_binary() {
+        *is_binary = true;
+        return None;
     }
-    let new_tree = commit.tree().ok();
-    let old_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
-    if !matches!(fc.status, FileStatus::Deleted) {
-        if let Some(t) = new_tree.as_ref() {
-            if !fc.new_path.is_empty() {
-                if let Ok(e) = t.get_path(Path::new(&fc.new_path)) {
-                    if let Ok(o) = e.to_object(repo) {
-                        if let Some(b) = o.as_blob() {
-                            if b.size() <= MAX_CONTENT_BYTES as usize && !b.is_binary() {
-                                fc.new_content = String::from_utf8(b.content().to_vec()).ok();
-                            }
-                        }
-                    }
-                }
+    if blob.size() > MAX_CONTENT_BYTES as usize {
+        return None;
+    }
+    String::from_utf8(blob.content().to_vec()).ok()
+}
+
+/// Populate old/new contents from two trees (commit-vs-parent, base-vs-head).
+fn fill_tree_contents(
+    repo: &Repository,
+    old_tree: Option<&git2::Tree>,
+    new_tree: Option<&git2::Tree>,
+    files: &mut [FileChange],
+) {
+    for fc in files.iter_mut() {
+        if fc.is_binary {
+            continue;
+        }
+        if !matches!(fc.status, FileStatus::Deleted) && !fc.new_path.is_empty() {
+            if let Some(t) = new_tree {
+                fc.new_content = blob_text(repo, t, &fc.new_path, &mut fc.is_binary);
+            }
+        }
+        if !matches!(fc.status, FileStatus::Added) && !fc.old_path.is_empty() {
+            if let Some(t) = old_tree {
+                fc.old_content = blob_text(repo, t, &fc.old_path, &mut fc.is_binary);
             }
         }
     }
-    if !matches!(fc.status, FileStatus::Added) {
-        if let Some(t) = old_tree.as_ref() {
-            if !fc.old_path.is_empty() {
-                if let Ok(e) = t.get_path(Path::new(&fc.old_path)) {
-                    if let Ok(o) = e.to_object(repo) {
-                        if let Some(b) = o.as_blob() {
-                            if b.size() <= MAX_CONTENT_BYTES as usize && !b.is_binary() {
-                                fc.old_content = String::from_utf8(b.content().to_vec()).ok();
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 pub fn is_test_path(p: &str) -> bool {

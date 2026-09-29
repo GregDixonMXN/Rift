@@ -345,12 +345,8 @@ fn walk_ts(
         "lexical_declaration" | "variable_declaration" => {
             // const X = (...) => ... / describe/it/test blocks
             let text = node.utf8_text(src).unwrap_or_default();
-            let trimmed = text.trim_start_matches(|c| c == ' ' || c == '\n' || c == '\t');
-            let kw = if trimmed.starts_with("export") {
-                &trimmed[6..]
-            } else {
-                trimmed
-            };
+            let trimmed = text.trim_start();
+            let kw = trimmed.strip_prefix("export").unwrap_or(trimmed);
             let kw = kw.trim_start();
             if kw.starts_with("const ") || kw.starts_with("let ") || kw.starts_with("var ") {
                 if let Some(name) = child_name(&node, src) {

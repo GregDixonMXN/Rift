@@ -9,3 +9,8 @@ rift-parser = { path = "../rift-parser" }
 anyhow = { workspace = true }
 serde = { workspace = true }
 similar = { workspace = true }
+
+[dev-dependencies]
+rift-git = { path = "../rift-git" }
+git2 = { workspace = true }
+tempfile = { workspace = true }
