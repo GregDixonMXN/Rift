@@ -540,6 +540,77 @@ fn is_call_keyword(name: &str) -> bool {
     )
 }
 
+/// Imported names per file, for dependency edges. Best-effort per language
+/// family: answers "does this file import `name`?" without full resolution.
+/// Sorted and deduplicated.
+pub fn imported_names(lang: Language, content: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let t = line.trim();
+        match lang {
+            Language::Rust => {
+                if let Some(rest) = t.strip_prefix("use ") {
+                    let rest = rest.trim_end_matches(';');
+                    for id in ident_list(rest) {
+                        if !matches!(id.as_str(), "crate" | "self" | "super" | "Self") {
+                            out.push(id);
+                        }
+                    }
+                }
+            }
+            Language::JavaScript | Language::TypeScript => {
+                if t.starts_with("import ") || t.contains("require(") {
+                    for id in ident_list(t) {
+                        if !matches!(
+                            id.as_str(),
+                            "import"
+                                | "from"
+                                | "export"
+                                | "as"
+                                | "default"
+                                | "require"
+                                | "const"
+                                | "let"
+                                | "var"
+                        ) {
+                            out.push(id);
+                        }
+                    }
+                }
+            }
+            Language::Python if t.starts_with("import ") || t.starts_with("from ") => {
+                for id in ident_list(t) {
+                    if !matches!(id.as_str(), "import" | "from" | "as") {
+                        out.push(id);
+                    }
+                }
+            }
+            Language::Python => {}
+            _ => {}
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Bare identifiers in a snippet (dotted paths split: `a.b` → a, b).
+fn ident_list(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for c in s.chars() {
+        if c.is_alphanumeric() || c == '_' {
+            cur.push(c);
+        } else if !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
 /// Does a test name target a symbol? `test_login`, `login_test`,
 /// `testLogin`, `TestLogin` all target `login` (case-insensitive).
 /// Bare affixes without a separator only count on a camel boundary, so
@@ -914,5 +985,24 @@ mod tests {
         assert!(test_targets("should_reject_expired", "reject_expired"));
         assert!(!test_targets("test_login", "logout"));
         assert!(!test_targets("testing", "ing"));
+    }
+
+    #[test]
+    fn imported_names_per_language() {
+        let rs = "use crate::auth::{login, session};\nuse super::util;\nfn f() {}";
+        let ids = imported_names(Language::Rust, rs);
+        assert!(ids.contains(&"login".to_string()), "{ids:?}");
+        assert!(ids.contains(&"session".to_string()), "{ids:?}");
+        assert!(!ids.contains(&"crate".to_string()), "{ids:?}");
+
+        let js = "import { login } from './auth';\nimport def from 'x';\nconst y = login();";
+        let ids = imported_names(Language::JavaScript, js);
+        assert!(ids.contains(&"login".to_string()), "{ids:?}");
+        assert!(!ids.contains(&"from".to_string()), "{ids:?}");
+
+        let py = "from .auth import login\nimport os\n";
+        let ids = imported_names(Language::Python, py);
+        assert!(ids.contains(&"login".to_string()), "{ids:?}");
+        assert!(!ids.contains(&"from".to_string()), "{ids:?}");
     }
 }

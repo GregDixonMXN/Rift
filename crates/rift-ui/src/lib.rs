@@ -228,8 +228,10 @@ pub fn run_native_progressive(
                 }
             }
             let syms_all = rift_analysis::link_moves(&wfiles, syms_all);
+            let ctx = rift_analysis::collect_context(&wroot, &wfiles);
             let mut items = rift_analysis::group_items(&wfiles, &syms_all);
-            rift_analysis::apply_test_coverage(&wfiles, &syms_all, &mut items, &wroot);
+            rift_analysis::apply_test_coverage(&wfiles, &syms_all, &mut items, &ctx);
+            rift_analysis::apply_blast_radius(&wfiles, &mut items, &ctx);
             let stats = rift_analysis::compute_stats(&wfiles, &syms_all, &items);
             let _ = tx.send(UiMsg::Finished {
                 items,

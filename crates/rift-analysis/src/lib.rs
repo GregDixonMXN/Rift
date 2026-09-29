@@ -5,7 +5,7 @@ use rift_core::{
     Category, ChangeSet, Evidence, FileChange, FileStatus, Language, ReviewItem, Severity,
     SymbolChange, SymbolChangeKind, SymbolKind,
 };
-use rift_parser::{called_names, diff_symbols, extract_symbols, test_targets};
+use rift_parser::{called_names, diff_symbols, extract_symbols, imported_names, test_targets};
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
@@ -34,8 +34,10 @@ pub fn analyze(
     // Relocation reads as relocation: link cross-file moves and reorders
     // before grouping so delete+add pairs become Moved entries.
     let sym_changes = link_moves(files, sym_changes);
+    let ctx = collect_context(repo_root, files);
     let mut items = group_items(files, &sym_changes);
-    apply_test_coverage(files, &sym_changes, &mut items, repo_root);
+    apply_test_coverage(files, &sym_changes, &mut items, &ctx);
+    apply_blast_radius(files, &mut items, &ctx);
     (sym_changes, items)
 }
 
@@ -455,17 +457,35 @@ fn link_exact_pair(r: &SymbolChange, a: &SymbolChange) -> SymbolChange {
 // Test coverage linking
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone)]
 struct TestInfo {
     name: String,
     file: String,
     calls: Vec<String>,
 }
 
-/// Test symbols from unchanged worktree files. Bounded (file count + size),
-/// deterministic (sorted traversal), and skips files already in the diff.
-/// Coverage resolves against the worktree even when reviewing old commits.
-fn scan_worktree_tests(root: &str, files: &[FileChange]) -> Vec<TestInfo> {
+/// One non-diff source file: what it defines, calls, and imports.
+#[derive(Debug, Clone)]
+struct SourceRef {
+    path: String,
+    symbols: Vec<String>,
+    calls: Vec<String>,
+    imports: Vec<String>,
+}
+
+/// Bounded worktree context shared by coverage and blast-radius passes.
+#[derive(Debug, Default)]
+pub struct RepoContext {
+    tests: Vec<TestInfo>,
+    sources: Vec<SourceRef>,
+}
+
+/// Bounded worktree context for coverage and blast-radius passes.
+/// Deterministic (sorted traversal); skips files already in the diff.
+/// Resolves against the worktree even when reviewing old commits.
+pub fn collect_context(root: &str, files: &[FileChange]) -> RepoContext {
     const MAX_SCAN_FILES: usize = 200;
+    const MAX_SCAN_SOURCES: usize = 400;
     const MAX_SCAN_BYTES: u64 = 256 * 1024;
     const SKIP_DIRS: [&str; 9] = [
         ".git",
@@ -478,17 +498,18 @@ fn scan_worktree_tests(root: &str, files: &[FileChange]) -> Vec<TestInfo> {
         "__pycache__",
         ".venv",
     ];
-    let mut out = Vec::new();
+    let mut ctx = RepoContext::default();
     if root.is_empty() {
-        return out;
+        return ctx;
     }
     let root_path = std::path::Path::new(root);
     if !root_path.is_dir() {
-        return out;
+        return ctx;
     }
     let in_diff: std::collections::HashSet<&str> = files.iter().map(|f| f.display_path()).collect();
     let mut stack = vec![root_path.to_path_buf()];
-    let mut scanned = 0;
+    let mut scanned_tests = 0;
+    let mut scanned_sources = 0;
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
@@ -511,11 +532,12 @@ fn scan_worktree_tests(root: &str, files: &[FileChange]) -> Vec<TestInfo> {
             if rel.is_empty() || in_diff.contains(rel.as_str()) {
                 continue;
             }
-            if !rift_git::is_test_path(&rel) {
+            let is_test = rift_git::is_test_path(&rel);
+            if is_test && scanned_tests >= MAX_SCAN_FILES {
                 continue;
             }
-            if scanned >= MAX_SCAN_FILES {
-                return out;
+            if !is_test && scanned_sources >= MAX_SCAN_SOURCES {
+                continue;
             }
             let Ok(meta) = e.metadata() else { continue };
             if meta.len() > MAX_SCAN_BYTES {
@@ -524,23 +546,34 @@ fn scan_worktree_tests(root: &str, files: &[FileChange]) -> Vec<TestInfo> {
             let Ok(content) = std::fs::read_to_string(&p) else {
                 continue;
             };
-            scanned += 1;
             let lang = Language::from_path(&rel);
-            for s in extract_symbols(&rel, lang, &content) {
-                if !s.is_test {
-                    continue;
+            if is_test {
+                scanned_tests += 1;
+                for s in extract_symbols(&rel, lang, &content) {
+                    if !s.is_test {
+                        continue;
+                    }
+                    let body =
+                        symbol_body(&content, Some((s.start_line, s.end_line))).unwrap_or_default();
+                    ctx.tests.push(TestInfo {
+                        name: s.name.clone(),
+                        file: rel.clone(),
+                        calls: called_names(&body),
+                    });
                 }
-                let body =
-                    symbol_body(&content, Some((s.start_line, s.end_line))).unwrap_or_default();
-                out.push(TestInfo {
-                    name: s.name.clone(),
-                    file: rel.clone(),
-                    calls: called_names(&body),
+            } else {
+                scanned_sources += 1;
+                let table = extract_symbols(&rel, lang, &content);
+                ctx.sources.push(SourceRef {
+                    path: rel.clone(),
+                    symbols: table.iter().map(|s| s.name.clone()).collect(),
+                    calls: called_names(&content),
+                    imports: imported_names(lang, &content),
                 });
             }
         }
     }
-    out
+    ctx
 }
 
 /// Link changed symbols to the tests that exercise them.
@@ -554,7 +587,7 @@ pub fn apply_test_coverage(
     files: &[FileChange],
     syms: &[SymbolChange],
     items: &mut [ReviewItem],
-    repo_root: &str,
+    ctx: &RepoContext,
 ) {
     let mut tests: Vec<TestInfo> = Vec::new();
     for f in files {
@@ -575,7 +608,7 @@ pub fn apply_test_coverage(
         }
     }
     // Unchanged worktree test files still cover changed symbols.
-    tests.extend(scan_worktree_tests(repo_root, files));
+    tests.extend(ctx.tests.iter().cloned());
     if tests.is_empty() {
         return;
     }
@@ -647,6 +680,87 @@ pub fn apply_test_coverage(
                 path,
             ));
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Blast radius
+// ---------------------------------------------------------------------------
+
+/// Flag the non-test dependents of each changed symbol.
+///
+/// A reference counts when the caller imports the name (dependency edge) or
+/// the name is defined exactly once repo-wide (unambiguous call). Test files
+/// are excluded — they are reported by coverage instead. Runs after
+/// grouping; the UI worker applies the same step.
+pub fn apply_blast_radius(files: &[FileChange], items: &mut [ReviewItem], ctx: &RepoContext) {
+    // name -> defining files (worktree sources + changed files' new tree).
+    let mut defn: HashMap<String, Vec<String>> = HashMap::new();
+    for s in &ctx.sources {
+        for n in &s.symbols {
+            defn.entry(n.clone()).or_default().push(s.path.clone());
+        }
+    }
+    for f in files {
+        let path = f.display_path();
+        let Some(content) = f.new_content.as_deref() else {
+            continue;
+        };
+        for s in extract_symbols(path, f.language, content) {
+            defn.entry(s.name.clone())
+                .or_default()
+                .push(path.to_string());
+        }
+    }
+    for v in defn.values_mut() {
+        v.sort();
+        v.dedup();
+    }
+    // Names that are themselves tests are not blast subjects.
+    let test_names: std::collections::HashSet<&str> =
+        ctx.tests.iter().map(|t| t.name.as_str()).collect();
+
+    for item in items.iter_mut().filter(|i| i.id.starts_with("file:")) {
+        let Some(path) = item.files.first().cloned() else {
+            continue;
+        };
+        let mut affected: Vec<String> = Vec::new();
+        for sym_name in &item.symbols {
+            // Renames read "old → new": dependents follow the new name.
+            let name = sym_name.rsplit(" → ").next().unwrap_or(sym_name);
+            if test_names.contains(name) {
+                continue;
+            }
+            let unique = defn.get(name).map(|v| v.len() == 1).unwrap_or(false);
+            for src in &ctx.sources {
+                if src.path == path || rift_git::is_test_path(&src.path) {
+                    continue;
+                }
+                if !src.calls.iter().any(|c| c == name) {
+                    continue;
+                }
+                if src.imports.iter().any(|i| i == name) || unique {
+                    affected.push(src.path.clone());
+                }
+            }
+        }
+        affected.sort();
+        affected.dedup();
+        if affected.is_empty() {
+            continue;
+        }
+        let shown: Vec<&str> = affected.iter().take(8).map(|s| s.as_str()).collect();
+        let mut summary = format!(
+            "referenced by {} file{}: {}",
+            affected.len(),
+            if affected.len() == 1 { "" } else { "s" },
+            shown.join(", ")
+        );
+        if affected.len() > shown.len() {
+            summary.push_str(&format!(" (and {} more)", affected.len() - shown.len()));
+        }
+        item.evidence
+            .push(Evidence::new("blast-radius", &summary, &path));
     }
 }
 
@@ -1486,8 +1600,10 @@ mod tests {
             worker_syms.extend(file_symbols(f));
         }
         let worker_syms = link_moves(&worker_files, worker_syms);
+        let ctx = collect_context("", &worker_files);
         let mut worker_items = group_items(&worker_files, &worker_syms);
-        apply_test_coverage(&worker_files, &worker_syms, &mut worker_items, "");
+        apply_test_coverage(&worker_files, &worker_syms, &mut worker_items, &ctx);
+        apply_blast_radius(&worker_files, &mut worker_items, &ctx);
         let worker_stats = compute_stats(&worker_files, &worker_syms, &worker_items);
 
         fn js<T: serde::Serialize>(v: &T) -> String {
@@ -1722,7 +1838,9 @@ mod tests {
         let syms: Vec<SymbolChange> = files.iter().flat_map(file_symbols).collect();
         let syms = link_moves(&files, syms);
         let mut items = group_items(&files, &syms);
-        apply_test_coverage(&files, &syms, &mut items, dir.path().to_str().unwrap());
+        let ctx = collect_context(dir.path().to_str().unwrap(), &files);
+        apply_test_coverage(&files, &syms, &mut items, &ctx);
+        apply_blast_radius(&files, &mut items, &ctx);
         let item = items
             .iter()
             .find(|i| i.id == "file:src/auth.rs")
@@ -1734,6 +1852,80 @@ mod tests {
             .expect("covering evidence");
         assert!(ev.summary.contains("test_login"), "{}", ev.summary);
         assert!(ev.summary.contains("tests/auth_test.rs"), "{}", ev.summary);
+    }
+
+    #[test]
+    fn blast_radius_lists_unique_callers() {
+        // routes.rs outside the diff calls changed login; only definer.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/routes.rs"),
+            "use crate::auth::login;\n\npub fn handle() {\n    login(\"x\");\n}\n",
+        )
+        .unwrap();
+        let mut files = vec![moved_fc(
+            "src/auth.rs",
+            Some("pub fn login(user: &str) -> bool {\n    false\n}\n"),
+            Some("pub fn login(user: &str) -> bool {\n    check(user)\n}\n"),
+        )];
+        mark_generated(&mut files);
+        let syms: Vec<SymbolChange> = files.iter().flat_map(file_symbols).collect();
+        let syms = link_moves(&files, syms);
+        let mut items = group_items(&files, &syms);
+        let ctx = collect_context(dir.path().to_str().unwrap(), &files);
+        apply_blast_radius(&files, &mut items, &ctx);
+        let item = items
+            .iter()
+            .find(|i| i.id == "file:src/auth.rs")
+            .expect("auth item");
+        let ev = item
+            .evidence
+            .iter()
+            .find(|e| e.kind == "blast-radius")
+            .expect("blast evidence");
+        assert!(ev.summary.contains("src/routes.rs"), "{}", ev.summary);
+    }
+
+    #[test]
+    fn blast_radius_needs_edge_for_ambiguous_names() {
+        // Two definers of helper: caller without an import edge is skipped,
+        // caller with `use` edge counts.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/other.rs"), "pub fn helper() {}\n").unwrap();
+        std::fs::write(
+            dir.path().join("src/plain.rs"),
+            "pub fn run() {\n    helper();\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/wired.rs"),
+            "use crate::a::helper;\n\npub fn run() {\n    helper();\n}\n",
+        )
+        .unwrap();
+        let mut files = vec![moved_fc(
+            "src/a.rs",
+            Some("pub fn helper() {\n    1\n}\n"),
+            Some("pub fn helper() {\n    2\n}\n"),
+        )];
+        mark_generated(&mut files);
+        let syms: Vec<SymbolChange> = files.iter().flat_map(file_symbols).collect();
+        let syms = link_moves(&files, syms);
+        let mut items = group_items(&files, &syms);
+        let ctx = collect_context(dir.path().to_str().unwrap(), &files);
+        apply_blast_radius(&files, &mut items, &ctx);
+        let item = items
+            .iter()
+            .find(|i| i.id == "file:src/a.rs")
+            .expect("a item");
+        let ev = item
+            .evidence
+            .iter()
+            .find(|e| e.kind == "blast-radius")
+            .expect("blast evidence");
+        assert!(ev.summary.contains("src/wired.rs"), "{}", ev.summary);
+        assert!(!ev.summary.contains("src/plain.rs"), "{}", ev.summary);
     }
 
     #[test]
