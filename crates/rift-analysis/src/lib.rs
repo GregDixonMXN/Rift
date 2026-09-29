@@ -47,6 +47,14 @@ pub fn file_symbols(f: &FileChange) -> Vec<SymbolChange> {
     if f.is_binary || f.is_generated {
         return Vec::new();
     }
+    // Parsing is capped like content loading: oversize files keep line
+    // stats and whole-file entries, never a multi-second parse.
+    const MAX_PARSE_BYTES: usize = 512 * 1024;
+    if f.old_content.as_ref().map(|c| c.len()).unwrap_or(0) > MAX_PARSE_BYTES
+        || f.new_content.as_ref().map(|c| c.len()).unwrap_or(0) > MAX_PARSE_BYTES
+    {
+        return Vec::new();
+    }
     let path = f.display_path();
     let old_syms = f
         .old_content
@@ -109,10 +117,11 @@ fn move_origin(s: &SymbolChange) -> Option<&str> {
         .and_then(|e| e.strip_prefix(MOVED_FROM_PREFIX))
 }
 
-/// Body text for 1-based inclusive line spans; None when unavailable.
-fn symbol_body(content: &str, span: Option<(u32, u32)>) -> Option<String> {
+/// Body text for 1-based inclusive line spans from a pre-split line
+/// table. Split once per file, slice many times: symbol diffing touches
+/// every symbol, so per-call `lines().collect()` goes superlinear.
+fn body_slice(lines: &[&str], span: Option<(u32, u32)>) -> Option<String> {
     let (s, e) = span?;
-    let lines: Vec<&str> = content.lines().collect();
     if lines.is_empty() {
         return None;
     }
@@ -157,33 +166,43 @@ pub fn link_moves(files: &[FileChange], syms: Vec<SymbolChange>) -> Vec<SymbolCh
     }
     let mut removed: Vec<Cand> = Vec::new();
     let mut added: Vec<Cand> = Vec::new();
+    // Pre-split line tables per file: every candidate slices the same text.
+    let mut tables: HashMap<&str, (Vec<&str>, Vec<&str>)> = HashMap::new();
     for (idx, s) in syms.iter().enumerate() {
         let Some(f) = by_path.get(s.file.as_str()) else {
             continue;
         };
+        let entry = tables.entry(s.file.as_str()).or_insert_with(|| {
+            (
+                f.old_content
+                    .as_deref()
+                    .map(|c| c.lines().collect())
+                    .unwrap_or_default(),
+                f.new_content
+                    .as_deref()
+                    .map(|c| c.lines().collect())
+                    .unwrap_or_default(),
+            )
+        });
         match s.change {
             SymbolChangeKind::Removed => {
-                if let Some(content) = f.old_content.as_deref() {
-                    if let Some(body) = symbol_body(content, s.old_lines) {
-                        removed.push(Cand {
-                            idx,
-                            key: body_key(&body),
-                            nosig: nosig_key(&body),
-                            body,
-                        });
-                    }
+                if let Some(body) = body_slice(&entry.0, s.old_lines) {
+                    removed.push(Cand {
+                        idx,
+                        key: body_key(&body),
+                        nosig: nosig_key(&body),
+                        body,
+                    });
                 }
             }
             SymbolChangeKind::Added => {
-                if let Some(content) = f.new_content.as_deref() {
-                    if let Some(body) = symbol_body(content, s.new_lines) {
-                        added.push(Cand {
-                            idx,
-                            key: body_key(&body),
-                            nosig: nosig_key(&body),
-                            body,
-                        });
-                    }
+                if let Some(body) = body_slice(&entry.1, s.new_lines) {
+                    added.push(Cand {
+                        idx,
+                        key: body_key(&body),
+                        nosig: nosig_key(&body),
+                        body,
+                    });
                 }
             }
             _ => {}
@@ -313,6 +332,11 @@ pub fn link_moves(files: &[FileChange], syms: Vec<SymbolChange>) -> Vec<SymbolCh
             if a.file == r.file || a.kind != r.kind || a.name != r.name {
                 continue;
             }
+            // Similarity on huge bodies is quadratic text work for a 0.70
+            // guess: exact matching already had its chance in passes 1/1b.
+            if rc.body.len() + ac.body.len() > 128 * 1024 {
+                continue;
+            }
             let ratio = similar::TextDiff::from_lines(&rc.body, &ac.body).ratio();
             if ratio >= 0.80 {
                 consumed[rc.idx] = true;
@@ -342,6 +366,12 @@ pub fn link_moves(files: &[FileChange], syms: Vec<SymbolChange>) -> Vec<SymbolCh
     // (insertions/deletions already explain order shifts) but the sequence
     // differs — then displaced symbols genuinely moved.
     for f in files {
+        // Generated files never produced symbols in the first place;
+        // re-parsing them here only buys noise (and minified bundles are
+        // the slowest parses in the tree).
+        if f.is_generated {
+            continue;
+        }
         let path = f.display_path();
         let (Some(old_c), Some(new_c)) = (f.old_content.as_deref(), f.new_content.as_deref())
         else {
@@ -549,12 +579,13 @@ pub fn collect_context(root: &str, files: &[FileChange]) -> RepoContext {
             let lang = Language::from_path(&rel);
             if is_test {
                 scanned_tests += 1;
+                let lines: Vec<&str> = content.lines().collect();
                 for s in extract_symbols(&rel, lang, &content) {
                     if !s.is_test {
                         continue;
                     }
                     let body =
-                        symbol_body(&content, Some((s.start_line, s.end_line))).unwrap_or_default();
+                        body_slice(&lines, Some((s.start_line, s.end_line))).unwrap_or_default();
                     ctx.tests.push(TestInfo {
                         name: s.name.clone(),
                         file: rel.clone(),
@@ -591,15 +622,21 @@ pub fn apply_test_coverage(
 ) {
     let mut tests: Vec<TestInfo> = Vec::new();
     for f in files {
+        // Generated files contribute no test signal; parsing them here
+        // re-pays the slowest parses (minified bundles) for nothing.
+        if f.is_binary || f.is_generated {
+            continue;
+        }
         let path = f.display_path();
         let Some(content) = f.new_content.as_deref() else {
             continue;
         };
+        let lines: Vec<&str> = content.lines().collect();
         for s in extract_symbols(path, f.language, content) {
             if !(s.is_test || f.is_test_file) {
                 continue;
             }
-            let body = symbol_body(content, Some((s.start_line, s.end_line))).unwrap_or_default();
+            let body = body_slice(&lines, Some((s.start_line, s.end_line))).unwrap_or_default();
             tests.push(TestInfo {
                 name: s.name.clone(),
                 file: path.to_string(),
@@ -695,6 +732,8 @@ pub fn apply_test_coverage(
 /// grouping; the UI worker applies the same step.
 pub fn apply_blast_radius(files: &[FileChange], items: &mut [ReviewItem], ctx: &RepoContext) {
     // name -> defining files (worktree sources + changed files' new tree).
+    // Generated files are not definers: bundles duplicate src and would
+    // only dilute uniqueness (and repay the slowest parses).
     let mut defn: HashMap<String, Vec<String>> = HashMap::new();
     for s in &ctx.sources {
         for n in &s.symbols {
@@ -702,6 +741,9 @@ pub fn apply_blast_radius(files: &[FileChange], items: &mut [ReviewItem], ctx: &
         }
     }
     for f in files {
+        if f.is_binary || f.is_generated {
+            continue;
+        }
         let path = f.display_path();
         let Some(content) = f.new_content.as_deref() else {
             continue;
@@ -1950,5 +1992,34 @@ mod tests {
         let f = fc("src/plain.rs", r#"let s = "unsafe fn nope";"#, "let s = 1;");
         let s = score_file(&f, &[]);
         assert!(s.priority < 55, "priority was {}", s.priority);
+    }
+
+    #[test]
+    fn oversize_content_skips_parsing() {
+        // 600KB of functions: parsing is capped, no symbols out.
+        let mut big = String::new();
+        while big.len() < 600 * 1024 {
+            big.push_str("pub fn f() {}\n");
+        }
+        let f = moved_fc("src/big.rs", Some(&big), Some(&big));
+        assert!(file_symbols(&f).is_empty());
+    }
+
+    #[test]
+    fn reorder_skips_generated_files() {
+        // Same symbols, different order, but generated: no Moved entries.
+        let old = "pub fn a() {}\npub fn b() {}\n";
+        let new = "pub fn b() {}\npub fn a() {}\n";
+        let mut f = moved_fc("src/gen.rs", Some(old), Some(new));
+        f.is_generated = true;
+        let syms = file_symbols(&f);
+        assert!(syms.is_empty());
+        let linked = link_moves(std::slice::from_ref(&f), syms);
+        assert!(
+            linked
+                .iter()
+                .all(|s| !matches!(s.change, SymbolChangeKind::Moved)),
+            "{linked:?}"
+        );
     }
 }

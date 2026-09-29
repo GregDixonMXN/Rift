@@ -1284,6 +1284,10 @@ pub fn diff_symbols(
     for s in new_syms {
         new_map.insert((format!("{:?}", s.kind), s.name.clone()), s);
     }
+    // Split once: body comparison touches every matched pair, so per-pair
+    // `lines().collect()` goes superlinear on symbol-dense files.
+    let old_table: Vec<&str> = old_body.map(|b| b.lines().collect()).unwrap_or_default();
+    let new_table: Vec<&str> = new_body.map(|b| b.lines().collect()).unwrap_or_default();
     for (k, ns) in &new_map {
         match old_map.get(k) {
             None => {
@@ -1340,7 +1344,7 @@ pub fn diff_symbols(
                             os.signature, ns.signature
                         )],
                     });
-                } else if bodies_differ(old_body, new_body, os, ns) {
+                } else if bodies_differ(&old_table, &new_table, os, ns) {
                     out.push(SymbolChange {
                         file: file.to_string(),
                         name: ns.name.clone(),
@@ -1399,16 +1403,13 @@ pub fn diff_symbols(
 
 /// Compare symbol bodies when line ranges are known; fall back to
 /// signature-only (no false Modified) when ranges are unknown.
-fn bodies_differ(old_body: Option<&str>, new_body: Option<&str>, os: &Symbol, ns: &Symbol) -> bool {
+fn bodies_differ(old_lines: &[&str], new_lines: &[&str], os: &Symbol, ns: &Symbol) -> bool {
     if os.start_line == 0 || ns.start_line == 0 {
         return false;
     }
-    let (ob, nb) = match (old_body, new_body) {
-        (Some(a), Some(b)) => (a, b),
-        _ => return false,
-    };
-    let old_lines: Vec<&str> = ob.lines().collect();
-    let new_lines: Vec<&str> = nb.lines().collect();
+    if old_lines.is_empty() || new_lines.is_empty() {
+        return false;
+    }
     let slice = |lines: &[&str], s: u32, e: u32| -> String {
         if s == 0 {
             return String::new();
@@ -1421,8 +1422,8 @@ fn bodies_differ(old_body: Option<&str>, new_body: Option<&str>, os: &Symbol, ns
         }
         lines[a..b].join("\n")
     };
-    let o = slice(&old_lines, os.start_line, os.end_line);
-    let n = slice(&new_lines, ns.start_line, ns.end_line);
+    let o = slice(old_lines, os.start_line, os.end_line);
+    let n = slice(new_lines, ns.start_line, ns.end_line);
     if o.is_empty() || n.is_empty() {
         return false;
     }
