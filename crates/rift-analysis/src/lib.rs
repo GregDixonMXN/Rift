@@ -3,7 +3,7 @@
 
 use rift_core::{
     Category, ChangeSet, Evidence, FileChange, FileStatus, ReviewItem, Severity, SymbolChange,
-    SymbolChangeKind,
+    SymbolChangeKind, SymbolKind,
 };
 use rift_parser::{diff_symbols, extract_symbols};
 use std::collections::HashMap;
@@ -31,6 +31,9 @@ pub fn analyze(
         .into_iter()
         .flatten()
         .collect();
+    // Relocation reads as relocation: link cross-file moves and reorders
+    // before grouping so delete+add pairs become Moved entries.
+    let sym_changes = link_moves(files, sym_changes);
     let items = group_items(files, &sym_changes);
     (sym_changes, items)
 }
@@ -86,6 +89,365 @@ pub fn file_symbols(f: &FileChange) -> Vec<SymbolChange> {
         });
     }
     d
+}
+
+// ---------------------------------------------------------------------------
+// Move linking
+// ---------------------------------------------------------------------------
+
+/// Evidence prefix marking a cross-file move's origin file.
+const MOVED_FROM_PREFIX: &str = "moved-from:";
+
+/// Origin file of a cross-file Moved entry, if any. Reorder-within-file
+/// moves carry no origin and stay with their file's review item.
+fn move_origin(s: &SymbolChange) -> Option<&str> {
+    s.evidence
+        .first()
+        .and_then(|e| e.strip_prefix(MOVED_FROM_PREFIX))
+}
+
+/// Body text for 1-based inclusive line spans; None when unavailable.
+fn symbol_body(content: &str, span: Option<(u32, u32)>) -> Option<String> {
+    let (s, e) = span?;
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let s = (s.saturating_sub(1) as usize).min(lines.len());
+    let e = (e as usize).min(lines.len()).max(s);
+    Some(lines[s..e].join("\n"))
+}
+
+/// Whitespace-insensitive body key: relocated code matches exactly.
+fn body_key(body: &str) -> String {
+    body.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// Body key without the signature line: catches rename-in-move (the name
+/// lives on line one). Empty for single-line symbols — those never match.
+fn nosig_key(body: &str) -> String {
+    let mut lines = body.lines();
+    lines.next();
+    let rest: String = lines.collect();
+    let key: String = rest.chars().filter(|c| !c.is_whitespace()).collect();
+    key
+}
+
+fn kind_key(kind: SymbolKind) -> String {
+    format!("{kind:?}")
+}
+
+/// Link cross-file symbol moves and intra-file reorders.
+///
+/// Consumes Added/Removed pairs into Moved entries (same-file exact-body
+/// pairs become Renamed instead). Output is sorted by (file, name) so
+/// `--json` is stable across runs. Runs after per-file collection, before
+/// grouping; the UI worker applies the same step.
+pub fn link_moves(files: &[FileChange], syms: Vec<SymbolChange>) -> Vec<SymbolChange> {
+    let by_path: HashMap<&str, &FileChange> = files.iter().map(|f| (f.display_path(), f)).collect();
+
+    struct Cand {
+        idx: usize,
+        key: String,
+        nosig: String,
+        body: String,
+    }
+    let mut removed: Vec<Cand> = Vec::new();
+    let mut added: Vec<Cand> = Vec::new();
+    for (idx, s) in syms.iter().enumerate() {
+        let Some(f) = by_path.get(s.file.as_str()) else {
+            continue;
+        };
+        match s.change {
+            SymbolChangeKind::Removed => {
+                if let Some(content) = f.old_content.as_deref() {
+                    if let Some(body) = symbol_body(content, s.old_lines) {
+                        removed.push(Cand {
+                            idx,
+                            key: body_key(&body),
+                            nosig: nosig_key(&body),
+                            body,
+                        });
+                    }
+                }
+            }
+            SymbolChangeKind::Added => {
+                if let Some(content) = f.new_content.as_deref() {
+                    if let Some(body) = symbol_body(content, s.new_lines) {
+                        added.push(Cand {
+                            idx,
+                            key: body_key(&body),
+                            nosig: nosig_key(&body),
+                            body,
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // Deterministic pairing order.
+    removed.sort_by(|a, b| {
+        (syms[a.idx].file.clone(), syms[a.idx].name.clone())
+            .cmp(&(syms[b.idx].file.clone(), syms[b.idx].name.clone()))
+    });
+    added.sort_by(|a, b| {
+        (syms[a.idx].file.clone(), syms[a.idx].name.clone())
+            .cmp(&(syms[b.idx].file.clone(), syms[b.idx].name.clone()))
+    });
+
+    let mut consumed = vec![false; syms.len()];
+    let mut linked: Vec<SymbolChange> = Vec::new();
+
+    // Pass 1: exact body matches. Pair only unambiguous keys (one removed
+    // × one added) so duplicated boilerplate never links wrongly.
+    let mut r_groups: std::collections::BTreeMap<(String, String), Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (pos, c) in removed.iter().enumerate() {
+        r_groups
+            .entry((kind_key(syms[c.idx].kind), c.key.clone()))
+            .or_default()
+            .push(pos);
+    }
+    let mut a_groups: std::collections::BTreeMap<(String, String), Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (pos, c) in added.iter().enumerate() {
+        a_groups
+            .entry((kind_key(syms[c.idx].kind), c.key.clone()))
+            .or_default()
+            .push(pos);
+    }
+    for (kk, rs) in &r_groups {
+        if rs.len() != 1 {
+            continue;
+        }
+        let Some(aa) = a_groups.get(kk) else { continue };
+        if aa.len() != 1 {
+            continue;
+        }
+        let r = &syms[removed[rs[0]].idx];
+        let a = &syms[added[aa[0]].idx];
+        consumed[removed[rs[0]].idx] = true;
+        consumed[added[aa[0]].idx] = true;
+        linked.push(link_exact_pair(r, a));
+    }
+
+    // Pass 1b: same body modulo the signature line = rename-in-move.
+    // Same 1×1 rule; empty keys (single-line symbols) never match.
+    let mut r_nosig: std::collections::BTreeMap<(String, String), Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (pos, c) in removed.iter().enumerate() {
+        if consumed[c.idx] || c.nosig.is_empty() {
+            continue;
+        }
+        r_nosig
+            .entry((kind_key(syms[c.idx].kind), c.nosig.clone()))
+            .or_default()
+            .push(pos);
+    }
+    let mut a_nosig: std::collections::BTreeMap<(String, String), Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (pos, c) in added.iter().enumerate() {
+        if consumed[c.idx] || c.nosig.is_empty() {
+            continue;
+        }
+        a_nosig
+            .entry((kind_key(syms[c.idx].kind), c.nosig.clone()))
+            .or_default()
+            .push(pos);
+    }
+    for (kk, rs) in &r_nosig {
+        if rs.len() != 1 {
+            continue;
+        }
+        let Some(aa) = a_nosig.get(kk) else { continue };
+        if aa.len() != 1 {
+            continue;
+        }
+        let ri = removed[rs[0]].idx;
+        let ai = added[aa[0]].idx;
+        if consumed[ri] || consumed[ai] {
+            continue;
+        }
+        consumed[ri] = true;
+        consumed[ai] = true;
+        linked.push(link_exact_pair(&syms[ri], &syms[ai]));
+    }
+
+    // Pass 2: same name + similar body in different files = moved with edits.
+    // Only unambiguous (kind, name) pairs — duplicates stay unlinked.
+    let mut name_counts: std::collections::BTreeMap<(String, String), (usize, usize)> =
+        std::collections::BTreeMap::new();
+    for c in &removed {
+        if !consumed[c.idx] {
+            name_counts
+                .entry((kind_key(syms[c.idx].kind), syms[c.idx].name.clone()))
+                .or_default()
+                .0 += 1;
+        }
+    }
+    for c in &added {
+        if !consumed[c.idx] {
+            name_counts
+                .entry((kind_key(syms[c.idx].kind), syms[c.idx].name.clone()))
+                .or_default()
+                .1 += 1;
+        }
+    }
+    for rc in &removed {
+        if consumed[rc.idx] {
+            continue;
+        }
+        let r = &syms[rc.idx];
+        if name_counts.get(&(kind_key(r.kind), r.name.clone())) != Some(&(1, 1)) {
+            continue;
+        }
+        for ac in &added {
+            if consumed[ac.idx] {
+                continue;
+            }
+            let a = &syms[ac.idx];
+            if a.file == r.file || a.kind != r.kind || a.name != r.name {
+                continue;
+            }
+            let ratio = similar::TextDiff::from_lines(&rc.body, &ac.body).ratio();
+            if ratio >= 0.80 {
+                consumed[rc.idx] = true;
+                consumed[ac.idx] = true;
+                let pct = (ratio * 100.0).round() as u32;
+                linked.push(SymbolChange {
+                    file: a.file.clone(),
+                    name: a.name.clone(),
+                    kind: a.kind,
+                    change: SymbolChangeKind::Moved,
+                    confidence: 0.70,
+                    old_signature: r.old_signature.clone(),
+                    new_signature: a.new_signature.clone(),
+                    old_lines: r.old_lines,
+                    new_lines: a.new_lines,
+                    evidence: vec![
+                        format!("{MOVED_FROM_PREFIX}{}", r.file),
+                        format!("body {pct}% similar — moved with edits, verify the diff"),
+                    ],
+                });
+                break;
+            }
+        }
+    }
+
+    // Pass 3: intra-file reorder. Only when the symbol multiset is unchanged
+    // (insertions/deletions already explain order shifts) but the sequence
+    // differs — then displaced symbols genuinely moved.
+    for f in files {
+        let path = f.display_path();
+        let (Some(old_c), Some(new_c)) = (f.old_content.as_deref(), f.new_content.as_deref())
+        else {
+            continue;
+        };
+        let old_syms = extract_symbols(path, f.language, old_c);
+        let new_syms = extract_symbols(path, f.language, new_c);
+        let old_keys: Vec<String> = old_syms
+            .iter()
+            .map(|s| format!("{:?}::{}", s.kind, s.name))
+            .collect();
+        let new_keys: Vec<String> = new_syms
+            .iter()
+            .map(|s| format!("{:?}::{}", s.kind, s.name))
+            .collect();
+        if old_keys.len() != new_keys.len() {
+            continue;
+        }
+        let mut sorted_old = old_keys.clone();
+        sorted_old.sort();
+        let mut sorted_new = new_keys.clone();
+        sorted_new.sort();
+        if sorted_old != sorted_new || old_keys == new_keys {
+            continue;
+        }
+        let mut positions: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (i, k) in old_keys.iter().enumerate() {
+            positions.entry(k.as_str()).or_default().push(i);
+        }
+        let mut taken: HashMap<&str, usize> = HashMap::new();
+        for (j, k) in new_keys.iter().enumerate() {
+            let n = taken.entry(k.as_str()).or_insert(0);
+            let i = positions[k.as_str()][*n];
+            *n += 1;
+            if i != j {
+                let os = &old_syms[i];
+                let ns = &new_syms[j];
+                linked.push(SymbolChange {
+                    file: path.to_string(),
+                    name: ns.name.clone(),
+                    kind: ns.kind,
+                    change: SymbolChangeKind::Moved,
+                    confidence: 0.85,
+                    old_signature: Some(os.signature.clone()),
+                    new_signature: Some(ns.signature.clone()),
+                    old_lines: Some((os.start_line, os.end_line)),
+                    new_lines: Some((ns.start_line, ns.end_line)),
+                    evidence: vec![format!(
+                        "reordered within {path}: position {} → {}",
+                        i + 1,
+                        j + 1
+                    )],
+                });
+            }
+        }
+    }
+
+    let mut out: Vec<SymbolChange> = syms
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| !consumed[*i])
+        .map(|(_, s)| s)
+        .chain(linked)
+        .collect();
+    out.sort_by(|a, b| {
+        (&a.file, &a.name, kind_key(a.kind)).cmp(&(&b.file, &b.name, kind_key(b.kind)))
+    });
+    out
+}
+
+/// Build the Moved (or same-file Renamed) entry for an exact-body pair.
+fn link_exact_pair(r: &SymbolChange, a: &SymbolChange) -> SymbolChange {
+    let renamed = r.name != a.name;
+    if r.file == a.file {
+        return SymbolChange {
+            file: a.file.clone(),
+            name: format!("{} → {}", r.name, a.name),
+            kind: a.kind,
+            change: SymbolChangeKind::Renamed,
+            confidence: 0.85,
+            old_signature: r.old_signature.clone(),
+            new_signature: a.new_signature.clone(),
+            old_lines: r.old_lines,
+            new_lines: a.new_lines,
+            evidence: vec!["identical body, different name — treated as rename".to_string()],
+        };
+    }
+    let mut evidence = vec![format!("{MOVED_FROM_PREFIX}{}", r.file)];
+    if renamed {
+        evidence.push(format!("renamed {} → {} in the move", r.name, a.name));
+    } else {
+        evidence.push("body identical — pure relocation".to_string());
+    }
+    SymbolChange {
+        file: a.file.clone(),
+        name: if renamed {
+            format!("{} → {}", r.name, a.name)
+        } else {
+            a.name.clone()
+        },
+        kind: a.kind,
+        change: SymbolChangeKind::Moved,
+        confidence: 0.95,
+        old_signature: r.old_signature.clone(),
+        new_signature: a.new_signature.clone(),
+        old_lines: r.old_lines,
+        new_lines: a.new_lines,
+        evidence,
+    }
 }
 
 pub fn fill_stats(cs: &mut ChangeSet) {
@@ -578,12 +940,89 @@ pub fn group_items(files: &[FileChange], syms: &[SymbolChange]) -> Vec<ReviewIte
     }
     let bucketed_tests: Vec<&str> = pure_test_adds.iter().map(|f| f.display_path()).collect();
 
+    // 2b. Cross-file moves: one low-priority item per (from, to) pair.
+    // Reorder-within-file moves have no origin and stay with their file.
+    let mut move_pairs: std::collections::BTreeMap<(String, String), Vec<&SymbolChange>> =
+        std::collections::BTreeMap::new();
+    for s in syms
+        .iter()
+        .filter(|s| matches!(s.change, SymbolChangeKind::Moved))
+    {
+        if let Some(origin) = move_origin(s) {
+            move_pairs
+                .entry((origin.to_string(), s.file.clone()))
+                .or_default()
+                .push(s);
+        }
+    }
+    let mut move_covered: Vec<&str> = Vec::new();
+    for ((from, to), members) in &move_pairs {
+        let edited = members.iter().any(|s| s.confidence < 0.8);
+        let min_conf: f32 = members.iter().map(|s| s.confidence).fold(1.0, f32::min);
+        let title = if members.len() == 1 {
+            format!("{} moved {} → {}", members[0].name, from, to)
+        } else {
+            format!("{} symbols moved {} → {}", members.len(), from, to)
+        };
+        items.push(ReviewItem {
+            id: format!("move:{from}→{to}"),
+            title,
+            category: Category::Refactor,
+            severity: if edited {
+                Severity::Medium
+            } else {
+                Severity::Low
+            },
+            priority: if edited { 25 } else { 8 },
+            confidence: min_conf,
+            files: vec![from.clone(), to.clone()],
+            symbols: members.iter().map(|s| s.name.clone()).collect(),
+            evidence: members
+                .iter()
+                .map(|s| {
+                    let detail = s
+                        .evidence
+                        .iter()
+                        .skip(1)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    Evidence::new(
+                        "symbol-move",
+                        &format!(
+                            "{} ({:?}, {:.0}% confidence): {detail}",
+                            s.name,
+                            s.kind,
+                            s.confidence * 100.0
+                        ),
+                        to,
+                    )
+                })
+                .collect(),
+            why: if edited {
+                "Symbols relocated across files with small body edits. The move itself is safe; review the edits flagged on each symbol.".to_string()
+            } else {
+                "Pure relocation — bodies identical. Safe to skim; no behavior change.".to_string()
+            },
+        });
+        move_covered.push(from.as_str());
+        move_covered.push(to.as_str());
+    }
+
     // 3. Per-file items for everything else meaningful.
     for f in files.iter().filter(|f| {
         !f.is_generated && !f.looks_formatting_only() && !bucketed_tests.contains(&f.display_path())
     }) {
         let path = f.display_path();
-        let fsyms: &[&SymbolChange] = sym_by_file.get(path).map(|v| v.as_slice()).unwrap_or(&[]);
+        let fsyms: Vec<&SymbolChange> = sym_by_file
+            .get(path)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+            .iter()
+            .copied()
+            // Pair-covered moves live in their move item, not here.
+            .filter(|s| !(matches!(s.change, SymbolChangeKind::Moved) && move_origin(s).is_some()))
+            .collect();
         // Skip test files whose only changes are additions already bucketed.
         if f.is_test_file
             && !fsyms.is_empty()
@@ -593,13 +1032,17 @@ pub fn group_items(files: &[FileChange], syms: &[SymbolChange]) -> Vec<ReviewIte
         {
             continue;
         }
+        // Files fully explained by move pairs are covered by the pair item.
+        if fsyms.is_empty() && move_covered.contains(&path) {
+            continue;
+        }
         // Skip files with zero signal (e.g. binary with no parse).
         if fsyms.is_empty() && f.added_lines + f.deleted_lines == 0 {
             continue;
         }
-        let sc = score_file(f, fsyms);
-        let title = file_title(f, fsyms);
-        let why = file_why(f, fsyms, &sc);
+        let sc = score_file(f, &fsyms);
+        let title = file_title(f, &fsyms);
+        let why = file_why(f, &fsyms, &sc);
         items.push(ReviewItem {
             id: format!("file:{}", path),
             title,
@@ -799,13 +1242,14 @@ mod tests {
         let (batch_syms, batch_items) = analyze("r", "b", "h", &mut batch_files);
         let batch_stats = compute_stats(&batch_files, &batch_syms, &batch_items);
 
-        // Worker recipe: mark -> per-file symbols -> group -> stats.
+        // Worker recipe: mark -> per-file symbols -> link moves -> group -> stats.
         let mut worker_files = mk();
         mark_generated(&mut worker_files);
         let mut worker_syms = Vec::new();
         for f in worker_files.iter() {
             worker_syms.extend(file_symbols(f));
         }
+        let worker_syms = link_moves(&worker_files, worker_syms);
         let worker_items = group_items(&worker_files, &worker_syms);
         let worker_stats = compute_stats(&worker_files, &worker_syms, &worker_items);
 
@@ -818,6 +1262,107 @@ mod tests {
         // And the timeout change is actually caught (guards vacuous equality).
         assert_eq!(batch_syms.len(), 1);
         assert_eq!(batch_syms[0].name, "SESSION_TIMEOUT");
+    }
+
+    fn moved_fc(path: &str, old: Option<&str>, new: Option<&str>) -> FileChange {
+        FileChange {
+            old_path: path.to_string(),
+            new_path: path.to_string(),
+            status: FileStatus::Modified,
+            language: Language::from_path(path),
+            is_binary: false,
+            is_generated: false,
+            is_test_file: false,
+            added_lines: 5,
+            deleted_lines: 5,
+            hunks: vec![],
+            old_content: old.map(str::to_string),
+            new_content: new.map(str::to_string),
+        }
+    }
+
+    const HELPER: &str = "pub fn helper() -> i32 {\n    42\n}\n";
+
+    #[test]
+    fn cross_file_move_links() {
+        let old_a = format!("{HELPER}\npub fn keep() {{}}\n");
+        let new_b = format!("pub fn other() {{}}\n\n{HELPER}");
+        let mut files = vec![
+            moved_fc("src/a.rs", Some(old_a.as_str()), Some("pub fn keep() {}\n")),
+            moved_fc(
+                "src/b.rs",
+                Some("pub fn other() {}\n"),
+                Some(new_b.as_str()),
+            ),
+        ];
+        let (syms, items) = analyze("r", "b", "h", &mut files);
+        assert!(
+            syms.iter().all(|s| !matches!(
+                s.change,
+                SymbolChangeKind::Added | SymbolChangeKind::Removed
+            )),
+            "{syms:?}"
+        );
+        let m: Vec<_> = syms
+            .iter()
+            .filter(|s| matches!(s.change, SymbolChangeKind::Moved))
+            .collect();
+        assert_eq!(m.len(), 1, "{syms:?}");
+        assert_eq!(m[0].name, "helper");
+        assert_eq!(m[0].file, "src/b.rs");
+        assert!((m[0].confidence - 0.95).abs() < 1e-6);
+        // One pair item; both files fully explained by it.
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0].id, "move:src/a.rs→src/b.rs");
+        assert_eq!(items[0].category, Category::Refactor);
+        assert_eq!(items[0].severity, Severity::Low);
+    }
+
+    #[test]
+    fn move_with_rename_links() {
+        let renamed = HELPER.replace("helper", "helper2");
+        let mut files = vec![
+            moved_fc("src/a.rs", Some(HELPER), Some("")),
+            moved_fc("src/b.rs", Some(""), Some(&renamed)),
+        ];
+        let (syms, _) = analyze("r", "b", "h", &mut files);
+        let m: Vec<_> = syms
+            .iter()
+            .filter(|s| matches!(s.change, SymbolChangeKind::Moved))
+            .collect();
+        assert_eq!(m.len(), 1, "{syms:?}");
+        assert_eq!(m[0].name, "helper → helper2");
+    }
+
+    #[test]
+    fn intra_file_reorder_reports_moves() {
+        let old = "pub fn one() {\n    1\n}\n\npub fn two() {\n    2\n}\n";
+        let new = "pub fn two() {\n    2\n}\n\npub fn one() {\n    1\n}\n";
+        let mut files = vec![moved_fc("src/r.rs", Some(old), Some(new))];
+        let (syms, items) = analyze("r", "b", "h", &mut files);
+        assert_eq!(syms.len(), 2, "{syms:?}");
+        assert!(syms
+            .iter()
+            .all(|s| matches!(s.change, SymbolChangeKind::Moved)));
+        // Reorder moves stay with their file (no cross-file origin).
+        assert!(items.iter().any(|i| i.id == "file:src/r.rs"), "{items:?}");
+    }
+
+    #[test]
+    fn ambiguous_duplicate_bodies_do_not_link() {
+        // Same boilerplate removed in two files, added in one: no safe link.
+        let boiler = "pub fn boiler() {}\n";
+        let mut files = vec![
+            moved_fc("src/a.rs", Some(boiler), Some("")),
+            moved_fc("src/c.rs", Some(boiler), Some("")),
+            moved_fc("src/b.rs", Some(""), Some(boiler)),
+        ];
+        let (syms, _) = analyze("r", "b", "h", &mut files);
+        assert!(
+            syms.iter()
+                .all(|s| !matches!(s.change, SymbolChangeKind::Moved)),
+            "{syms:?}"
+        );
     }
 
     #[test]

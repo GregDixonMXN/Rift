@@ -683,22 +683,12 @@ fn bodies_differ(old_body: Option<&str>, new_body: Option<&str>, os: &Symbol, ns
         }
         lines[a..b].join("\n")
     };
-    let o = slice(&old_lines, os.start_line, padded_end(os));
-    let n = slice(&new_lines, ns.start_line, padded_end(ns));
+    let o = slice(&old_lines, os.start_line, os.end_line);
+    let n = slice(&new_lines, ns.start_line, ns.end_line);
     if o.is_empty() || n.is_empty() {
         return false;
     }
     normalize(&o) != normalize(&n)
-}
-
-/// End line for body comparison: exact multi-line ranges compare as-is;
-/// single-line/unknown ranges get a small window so nearby edits still count.
-fn padded_end(s: &Symbol) -> u32 {
-    if s.end_line > s.start_line {
-        s.end_line
-    } else {
-        s.start_line + 5
-    }
 }
 
 fn normalize(s: &str) -> String {

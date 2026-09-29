@@ -226,6 +226,7 @@ pub fn run_native_progressive(
                     return; // UI closed.
                 }
             }
+            let syms_all = rift_analysis::link_moves(&wfiles, syms_all);
             let items = rift_analysis::group_items(&wfiles, &syms_all);
             let stats = rift_analysis::compute_stats(&wfiles, &syms_all, &items);
             let _ = tx.send(UiMsg::Finished {
