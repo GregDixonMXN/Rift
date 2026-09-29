@@ -688,6 +688,11 @@ pub fn render_text_overview(cs: &ChangeSet) -> String {
         if !r.why.is_empty() {
             s.push_str(&format!("    {}\n", r.why));
         }
+        // Jev judgments are the headline of a --jev run; other evidence
+        // stays one drill-down away in --json and the GUI.
+        for e in r.evidence.iter().filter(|e| e.kind.starts_with("jev-")) {
+            s.push_str(&format!("    {}\n", e.summary));
+        }
     }
     let mech: Vec<_> = cs
         .review_items
@@ -788,6 +793,20 @@ mod tests {
         assert!(out.contains("auth timeout"), "{out}");
         assert!(out.contains("Mechanical (collapsed)"), "{out}");
         assert!(out.contains("2 files"), "{out}");
+    }
+
+    #[test]
+    fn text_overview_shows_jev_evidence() {
+        use rift_core::Evidence;
+        let mut it = item("a", "auth timeout", Category::Auth);
+        it.evidence
+            .push(Evidence::new("covering-tests", "covered by x", "a.rs"));
+        it.evidence
+            .push(Evidence::new("jev-risk", "Jev P(risky)=0.72", "a.rs"));
+        let cs = cs_with(vec![it]);
+        let out = render_text_overview(&cs);
+        assert!(out.contains("Jev P(risky)=0.72"), "{out}");
+        assert!(!out.contains("covered by x"), "{out}");
     }
 
     fn file_with_hunks(path: &str, hunks: usize, lines: usize) -> FileChange {

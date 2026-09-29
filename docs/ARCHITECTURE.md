@@ -32,6 +32,10 @@
   `.agents/skills/typesafe-ai/SKILL.md`; live docs at `docs.typesafe.ai`.
   Cloud API = opt-in only (local-first); the UI must always explain itself
   without it. No `TYPESAFE_API_KEY` in repo, ever.
+  Built: `rift-jev` crate + `rift --jev` (batch output). One call per
+  review, Noul risk + Score severity per behavior-grade item (max 25),
+  answers as `jev-risk`/`jev-severity` evidence. Uncalibrated: nothing
+  gates on the numbers yet.
 - **Symbol-bonus cap.** Per-symbol score contributions are capped in
   aggregate so a new 30-symbol file can't outrank an auth behavior change.
 - **Keyword hygiene.** Content signals (`unsafe`, `valid`, …) match on code

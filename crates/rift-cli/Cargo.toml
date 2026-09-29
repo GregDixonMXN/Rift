@@ -12,6 +12,7 @@ rift-core = { path = "../rift-core" }
 rift-git = { path = "../rift-git" }
 rift-parser = { path = "../rift-parser" }
 rift-analysis = { path = "../rift-analysis" }
+rift-jev = { path = "../rift-jev" }
 rift-ui = { path = "../rift-ui" }
 clap = { workspace = true }
 anyhow = { workspace = true }

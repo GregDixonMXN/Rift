@@ -10,6 +10,7 @@ matters, and what deserves human attention — before you merge.
     rift --commit <sha>   # one commit vs its parent
     rift main..HEAD       # branch comparison
     rift --json           # machine-readable ChangeSet (for agents/tools)
+    rift --jev --overview # add Jev risk/severity judgments (needs TYPESAFE_API_KEY)
 
 No accounts, no cloud, no config. Local-first and deterministic: parsing and
 static signals come before any probabilistic judgment, and every conclusion

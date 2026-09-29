@@ -1,0 +1,11 @@
+[package]
+name = "rift-jev"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rift-core = { path = "../rift-core" }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
