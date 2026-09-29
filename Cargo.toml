@@ -11,6 +11,7 @@ resolver = "2"
 
 [workspace.dependencies]
 anyhow = "1.0"
+criterion = "0.5"
 quote = "1.0"
 tempfile = "3"
 proc-macro2 = { version = "1.0", features = ["span-locations"] }

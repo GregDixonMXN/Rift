@@ -444,3 +444,88 @@ pub fn render_text_overview(cs: &ChangeSet) -> String {
     }
     s
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rift_core::{Category, ChangeStats, ReviewItem, Severity};
+
+    fn item(id: &str, title: &str, category: Category) -> ReviewItem {
+        ReviewItem {
+            id: id.into(),
+            title: title.into(),
+            category,
+            severity: Severity::Medium,
+            priority: 50,
+            confidence: 0.8,
+            files: vec!["a.rs".into()],
+            symbols: vec![],
+            evidence: vec![],
+            why: "because".into(),
+        }
+    }
+
+    fn cs_with(items: Vec<ReviewItem>) -> ChangeSet {
+        ChangeSet {
+            repo_root: ".".into(),
+            base_ref: "HEAD".into(),
+            head_ref: "worktree".into(),
+            files: vec![],
+            symbol_changes: vec![],
+            review_items: items,
+            stats: ChangeStats {
+                files_changed: 2,
+                added_lines: 10,
+                deleted_lines: 4,
+                meaningful_changes: 1,
+                mechanical_files: 1,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn mechanical_hidden_by_default() {
+        let cs = cs_with(vec![
+            item("a", "auth timeout", Category::Auth),
+            item("m", "lockfile", Category::Mechanical),
+        ]);
+        let app = RiftApp::new(cs);
+        assert_eq!(app.visible_items(), vec![0]);
+    }
+
+    #[test]
+    fn mechanical_toggle_reveals() {
+        let cs = cs_with(vec![
+            item("a", "auth timeout", Category::Auth),
+            item("m", "lockfile", Category::Mechanical),
+        ]);
+        let mut app = RiftApp::new(cs);
+        app.show_mechanical = true;
+        assert_eq!(app.visible_items().len(), 2);
+    }
+
+    #[test]
+    fn search_filters_title_and_path() {
+        let mut real = item("a", "auth timeout", Category::Auth);
+        real.files = vec!["src/session.rs".into()];
+        let cs = cs_with(vec![real, item("b", "readme tweak", Category::Docs)]);
+        let mut app = RiftApp::new(cs);
+        app.search = "session".into();
+        assert_eq!(app.visible_items(), vec![0]);
+        app.search = "nothing-matches-xyz".into();
+        assert!(app.visible_items().is_empty());
+    }
+
+    #[test]
+    fn text_overview_separates_mechanical() {
+        let cs = cs_with(vec![
+            item("a", "auth timeout", Category::Auth),
+            item("m", "lockfile", Category::Mechanical),
+        ]);
+        let out = render_text_overview(&cs);
+        assert!(out.contains("auth timeout"), "{out}");
+        assert!(out.contains("Mechanical (collapsed)"), "{out}");
+        assert!(out.contains("2 files"), "{out}");
+    }
+}

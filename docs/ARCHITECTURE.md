@@ -36,10 +36,15 @@
 
 ## What's next (in order)
 
-1. Harden MVP: fixture repos per change class, snapshot tests, benches
-   (diff extraction, parsing, matching), cancel-safe background analysis.
+1. Harden MVP: snapshot tests, cancel-safe background analysis.
 2. Milestone two: Python/C# depth, move detection, dependency graph +
    blast radius, test association, persistent content-hash cache, JEV trait
    + deterministic adapter.
 3. Milestone three: task-vs-change verification, optional LLM escalation on
    compact evidence packages, PR/hook integrations.
+
+## Perf baselines (criterion, Windows x64, debug)
+
+- `analyze_200_files`: ~1.85 ms — 200-file review grouping is trivial.
+- `extract_400_fns`: ~8.6 ms — syn extraction on a 400-function module.
+- Run: `cargo bench -p rift-parser -p rift-analysis`.
