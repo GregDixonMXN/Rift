@@ -4,7 +4,7 @@
 
     Git (rift-git)
       -> FileChange + hunks (normalized, library types never leak)
-      -> Symbols (rift-parser: syn for Rust, tree-sitter for TS/JS, regex fallback)
+      -> Symbols (rift-parser: syn for Rust, tree-sitter for TS/JS/Python/Go/C#, regex fallback)
       -> SymbolChange matching with confidence (rename via bigram similarity)
       -> Importance scoring + grouping (rift-analysis, deterministic)
       -> ChangeSet { files, symbol_changes, review_items, stats }
@@ -25,9 +25,13 @@
   100k-line diffs responsive; heavy analysis stays off the UI thread.
 - **Deterministic before probabilistic.** Importance scores are hand-tuned
   functions of path signals, symbol changes, and diff-content signals, each
-  emitting `Evidence`. A JEV probabilistic layer can sit *above* this model
-  later (trait boundary reserved), consuming structured facts — never raw
-  source — and the UI must always explain itself without it.
+  emitting `Evidence`. A Jev (TypeSafe System One) layer can sit *above* this
+  model later: state = structured facts (symbols, evidence summaries — never
+  raw source), questions = Noul ("is this behavior change risky?"), Score
+  (severity rubric), Choice (route review items). Skill:
+  `.agents/skills/typesafe-ai/SKILL.md`; live docs at `docs.typesafe.ai`.
+  Cloud API = opt-in only (local-first); the UI must always explain itself
+  without it. No `TYPESAFE_API_KEY` in repo, ever.
 - **Symbol-bonus cap.** Per-symbol score contributions are capped in
   aggregate so a new 30-symbol file can't outrank an auth behavior change.
 - **Keyword hygiene.** Content signals (`unsafe`, `valid`, …) match on code
