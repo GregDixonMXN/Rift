@@ -1,0 +1,18 @@
+[package]
+name = "rift-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rift"
+path = "src/main.rs"
+
+[dependencies]
+rift-core = { path = "../rift-core" }
+rift-git = { path = "../rift-git" }
+rift-parser = { path = "../rift-parser" }
+rift-analysis = { path = "../rift-analysis" }
+rift-ui = { path = "../rift-ui" }
+clap = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }

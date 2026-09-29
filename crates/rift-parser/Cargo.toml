@@ -1,0 +1,16 @@
+[package]
+name = "rift-parser"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rift-core = { path = "../rift-core" }
+anyhow = { workspace = true }
+serde = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-rust = "0.21"
+tree-sitter-javascript = "0.21"
+tree-sitter-typescript = "0.21"
+syn = { workspace = true }
+quote = { workspace = true }
+proc-macro2 = { workspace = true }

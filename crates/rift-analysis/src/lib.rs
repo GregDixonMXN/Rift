@@ -1,0 +1,775 @@
+//! Deterministic importance model + review-item grouping.
+//! No LLM, no randomness: every score traces to evidence.
+
+use rift_core::{
+    Category, ChangeSet, Evidence, FileChange, FileStatus, ReviewItem, Severity, SymbolChange,
+    SymbolChangeKind,
+};
+use rift_parser::{diff_symbols, extract_symbols};
+use std::collections::HashMap;
+
+// ---------------------------------------------------------------------------
+// Pipeline
+// ---------------------------------------------------------------------------
+
+pub fn analyze(
+    _repo_root: &str,
+    _base_ref: &str,
+    _head_ref: &str,
+    files: &mut [FileChange],
+) -> (Vec<SymbolChange>, Vec<ReviewItem>) {
+    mark_generated(files);
+    let mut sym_changes = Vec::new();
+    for f in files.iter() {
+        if f.is_binary || f.is_generated {
+            continue;
+        }
+        let path = f.display_path();
+        let old_syms = f
+            .old_content
+            .as_deref()
+            .map(|c| extract_symbols(&f.old_path, f.language, c))
+            .unwrap_or_default();
+        let new_syms = f
+            .new_content
+            .as_deref()
+            .map(|c| extract_symbols(path, f.language, c))
+            .unwrap_or_default();
+        // For added/deleted whole files, synthesize from one side.
+        let mut d = diff_symbols(
+            path,
+            &old_syms,
+            &new_syms,
+            f.old_content.as_deref(),
+            f.new_content.as_deref(),
+        );
+        // Whole-file add/delete with no parseable symbols still deserves one entry.
+        if d.is_empty()
+            && matches!(
+                f.status,
+                FileStatus::Added | FileStatus::Deleted | FileStatus::Untracked
+            )
+            && (f.added_lines + f.deleted_lines) > 0
+        {
+            d.push(SymbolChange {
+                file: path.to_string(),
+                name: path.to_string(),
+                kind: rift_core::SymbolKind::Module,
+                change: if matches!(f.status, FileStatus::Deleted) {
+                    SymbolChangeKind::Removed
+                } else {
+                    SymbolChangeKind::Added
+                },
+                confidence: 0.9,
+                old_signature: None,
+                new_signature: None,
+                old_lines: None,
+                new_lines: None,
+                evidence: vec!["whole file added/removed".to_string()],
+            });
+        }
+        sym_changes.extend(d);
+    }
+    let items = group_items(files, &sym_changes);
+    (sym_changes, items)
+}
+
+pub fn fill_stats(cs: &mut ChangeSet) {
+    let mut s = rift_core::ChangeStats::default();
+    s.files_changed = cs.files.len();
+    for f in &cs.files {
+        s.added_lines += f.added_lines;
+        s.deleted_lines += f.deleted_lines;
+        if f.is_generated || f.looks_formatting_only() {
+            s.mechanical_files += 1;
+        }
+        if f.is_test_file {
+            s.test_files += 1;
+        }
+    }
+    for sc in &cs.symbol_changes {
+        match sc.change {
+            SymbolChangeKind::Added => s.symbols_added += 1,
+            SymbolChangeKind::Removed => s.symbols_removed += 1,
+            _ => s.symbols_modified += 1,
+        }
+    }
+    s.meaningful_changes = cs
+        .review_items
+        .iter()
+        .filter(|r| !matches!(r.category, Category::Mechanical))
+        .count();
+    cs.stats = s;
+}
+
+// ---------------------------------------------------------------------------
+// Generated / mechanical detection
+// ---------------------------------------------------------------------------
+
+fn generated_by_name(path: &str) -> bool {
+    let l = path.to_lowercase();
+    // Lockfiles & vendored output (match full filename or any path segment,
+    // so root-level `target/` and nested dirs both hit).
+    for pat in [
+        "cargo.lock",
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "poetry.lock",
+        "pipfile.lock",
+        ".min.js",
+        ".min.css",
+        ".map",
+        ".bundle.js",
+    ] {
+        if l.ends_with(pat) {
+            return true;
+        }
+    }
+    let segs: Vec<&str> = l.split('/').collect();
+    for dir in [
+        "target",
+        "node_modules",
+        "dist",
+        "build",
+        ".next",
+        "vendor",
+        "__pycache__",
+        ".git",
+    ] {
+        if segs.contains(&dir) {
+            return true;
+        }
+    }
+    for ext in [".pb.go", ".generated.ts", ".g.cs", ".designer.cs", ".lock"] {
+        if l.ends_with(ext) {
+            return true;
+        }
+    }
+    false
+}
+
+fn generated_by_content(f: &FileChange) -> bool {
+    for src in [&f.old_content, &f.new_content] {
+        if let Some(c) = src {
+            // Check first 5 lines only — cheap.
+            for line in c.lines().take(5) {
+                let ll = line.to_lowercase();
+                if ll.contains("auto-generated")
+                    || ll.contains("autogenerated")
+                    || ll.contains("@generated")
+                    || (ll.contains("do not edit") && ll.contains("generat"))
+                {
+                    return true;
+                }
+            }
+            break;
+        }
+    }
+    false
+}
+
+pub fn mark_generated(files: &mut [FileChange]) {
+    for f in files.iter_mut() {
+        let p = f.display_path().to_string();
+        f.is_generated = generated_by_name(&p) || generated_by_content(f);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Importance scoring
+// ---------------------------------------------------------------------------
+
+struct Score {
+    priority: u8,
+    severity: Severity,
+    category: Category,
+    reasons: Vec<Evidence>,
+}
+
+fn score_file(f: &FileChange, syms: &[&SymbolChange]) -> Score {
+    let path = f.display_path().to_lowercase();
+    let mut points: i32 = 20;
+    let mut severity = Severity::Low;
+    let mut category = Category::Unknown;
+    let mut reasons = Vec::new();
+    let mut ev = |kind: &str, summary: &str| {
+        reasons.push(Evidence::new(kind, summary, f.display_path()));
+    };
+
+    if f.is_generated {
+        return Score {
+            priority: 2,
+            severity: Severity::Low,
+            category: Category::Mechanical,
+            reasons: vec![Evidence::new(
+                "generated",
+                "generated or lockfile output — collapsed by default",
+                f.display_path(),
+            )],
+        };
+    }
+    if f.looks_formatting_only() {
+        return Score {
+            priority: 3,
+            severity: Severity::Low,
+            category: Category::Mechanical,
+            reasons: vec![Evidence::new(
+                "formatting-only",
+                "whitespace/punctuation-only diff",
+                f.display_path(),
+            )],
+        };
+    }
+
+    // Auth / security surface.
+    let auth_hit = [
+        "auth",
+        "session",
+        "token",
+        "password",
+        "login",
+        "oauth",
+        "permission",
+        "secret",
+        "crypto",
+        "signin",
+        "sign-in",
+    ]
+    .iter()
+    .any(|k| path.contains(k));
+    if auth_hit {
+        points += 45;
+        severity = severity.max(Severity::High);
+        category = Category::Auth;
+        ev(
+            "auth-surface",
+            "change touches authentication/authorization surface",
+        );
+    }
+    // Schema / migration.
+    let schema_hit = path.contains("migrat")
+        || path.contains("schema")
+        || path.ends_with(".sql")
+        || path.contains("prisma/")
+        || path.contains("alembic/");
+    if schema_hit {
+        points += 40;
+        severity = severity.max(Severity::High);
+        if category == Category::Unknown {
+            category = Category::Schema;
+        }
+        ev("schema", "database schema or migration change");
+    }
+    // Dependency manifests.
+    let dep_hit = path.ends_with("cargo.toml")
+        || path.ends_with("package.json")
+        || path.ends_with("pyproject.toml")
+        || path.ends_with("requirements.txt")
+        || path.ends_with(".csproj")
+        || path.ends_with("go.mod");
+    if dep_hit {
+        points += 30;
+        severity = severity.max(Severity::Medium);
+        if category == Category::Unknown {
+            category = Category::Dependency;
+        }
+        ev("dependency-manifest", "dependency manifest changed");
+    }
+    // Deploy / config.
+    let cfg_hit = path.contains("dockerfile")
+        || path.contains("k8s/")
+        || path.contains("deploy/")
+        || path.contains(".github/workflows/")
+        || path.ends_with(".env")
+        || path.contains("appsettings");
+    if cfg_hit {
+        points += 25;
+        severity = severity.max(Severity::Medium);
+        if category == Category::Unknown {
+            category = Category::Config;
+        }
+        ev(
+            "deploy-config",
+            "deployment or runtime configuration changed",
+        );
+    }
+    // Test files: informative but low priority (unless existing tests modified).
+    if f.is_test_file {
+        points -= 10;
+        if category == Category::Unknown {
+            category = Category::Test;
+        }
+        ev(
+            "test-file",
+            "test file — verifies behavior, rarely the risk itself",
+        );
+    }
+    // Docs-only.
+    if path.ends_with(".md") || path.ends_with(".rst") || path.contains("/docs/") {
+        points -= 12;
+        if category == Category::Unknown {
+            category = Category::Docs;
+        }
+        ev("docs", "documentation change");
+    }
+    // Symbol-level signals. Per-symbol bonuses are capped in aggregate so a
+    // brand-new file with 30 added symbols doesn't outrank an auth change.
+    let mut symbol_bonus: i32 = 0;
+    for s in syms {
+        match s.change {
+            SymbolChangeKind::Removed => {
+                symbol_bonus += 25;
+                severity = severity.max(Severity::High);
+                if category == Category::Unknown {
+                    category = Category::ApiBreak;
+                }
+                ev("symbol-removed", &format!("symbol removed: {}", s.name));
+            }
+            SymbolChangeKind::SignatureChanged => {
+                symbol_bonus += 22;
+                severity = severity.max(Severity::Medium);
+                if category == Category::Unknown {
+                    category = Category::Behavior;
+                }
+                ev(
+                    "signature-changed",
+                    &format!("signature changed: {}", s.name),
+                );
+            }
+            SymbolChangeKind::VisibilityChanged => {
+                symbol_bonus += 20;
+                severity = severity.max(Severity::Medium);
+                ev(
+                    "visibility-changed",
+                    &format!("visibility changed: {}", s.name),
+                );
+            }
+            SymbolChangeKind::Renamed | SymbolChangeKind::Moved => {
+                symbol_bonus += 5;
+                ev("rename-move", &format!("renamed/moved: {}", s.name));
+            }
+            SymbolChangeKind::Modified => {
+                symbol_bonus += 12;
+                if category == Category::Unknown {
+                    category = Category::Behavior;
+                }
+            }
+            SymbolChangeKind::Added => {
+                symbol_bonus += 8;
+                if category == Category::Unknown {
+                    category = Category::Behavior;
+                }
+            }
+            SymbolChangeKind::FormattingOnly => {
+                points -= 5;
+            }
+        }
+    }
+    points += symbol_bonus.clamp(0, 25);
+    // Content signals on added lines.
+    let added_text: String = f
+        .hunks
+        .iter()
+        .flat_map(|h| h.lines.iter())
+        .filter(|l| matches!(l.kind, rift_core::DiffLineKind::Addition))
+        .map(|l| l.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_lowercase();
+    let deleted_text: String = f
+        .hunks
+        .iter()
+        .flat_map(|h| h.lines.iter())
+        .filter(|l| matches!(l.kind, rift_core::DiffLineKind::Deletion))
+        .map(|l| l.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_lowercase();
+    let has_unsafe = f
+        .hunks
+        .iter()
+        .flat_map(|h| h.lines.iter())
+        .filter(|l| matches!(l.kind, rift_core::DiffLineKind::Addition))
+        .map(|l| strip_string_literals(&l.text).trim().to_lowercase())
+        .any(|t| {
+            t.starts_with("unsafe")
+                || t.contains("unsafe fn")
+                || t.contains("unsafe {")
+                || t.contains("unsafe impl")
+                || t.contains("unsafe trait")
+                || t.contains("unsafe extern")
+        });
+    if has_unsafe && f.language == rift_core::Language::Rust {
+        points += 20;
+        severity = severity.max(Severity::High);
+        ev("unsafe", "new `unsafe` code");
+    }
+    if deleted_text.contains("valid") && !added_text.contains("valid") {
+        points += 18;
+        severity = severity.max(Severity::High);
+        if category == Category::Unknown {
+            category = Category::Security;
+        }
+        ev(
+            "validation-removed",
+            "deleted lines mention validation with no replacement",
+        );
+    }
+    if (deleted_text.contains("if ") || deleted_text.contains("match "))
+        && (added_text.contains("if ") || added_text.contains("match "))
+    {
+        points += 10;
+        ev("conditional-changed", "branch conditions modified");
+    }
+    if path.contains("secret") || path.contains("credential") || path.contains("key") {
+        if added_text.contains("secret")
+            || added_text.contains("token")
+            || added_text.contains("password")
+        {
+            points += 25;
+            severity = severity.max(Severity::Critical);
+            category = Category::Security;
+            ev("secret-handling", "secret/credential handling touched");
+        }
+    }
+
+    let priority = points.clamp(0, 100) as u8;
+    if category == Category::Unknown {
+        category = if priority >= 55 {
+            Category::Behavior
+        } else if f.is_test_file {
+            Category::Test
+        } else {
+            Category::Refactor
+        };
+    }
+    if priority >= 80 {
+        severity = severity.max(Severity::Critical);
+    } else if priority >= 55 {
+        severity = severity.max(Severity::Medium);
+    }
+    Score {
+        priority,
+        severity,
+        category,
+        reasons,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Grouping into review items
+// ---------------------------------------------------------------------------
+
+fn group_items(files: &[FileChange], syms: &[SymbolChange]) -> Vec<ReviewItem> {
+    let mut items = Vec::new();
+    let sym_by_file: HashMap<&str, Vec<&SymbolChange>> = {
+        let mut m: HashMap<&str, Vec<&SymbolChange>> = HashMap::new();
+        for s in syms {
+            m.entry(s.file.as_str()).or_default().push(s);
+        }
+        m
+    };
+
+    // 1. Mechanical bucket.
+    let mech: Vec<&FileChange> = files
+        .iter()
+        .filter(|f| f.is_generated || f.looks_formatting_only())
+        .collect();
+    if !mech.is_empty() {
+        let total: usize = mech.iter().map(|f| f.added_lines + f.deleted_lines).sum();
+        items.push(ReviewItem {
+            id: "mechanical".to_string(),
+            title: format!(
+                "Generated / mechanical changes — {} file{} collapsed",
+                mech.len(),
+                if mech.len() == 1 { "" } else { "s" }
+            ),
+            category: Category::Mechanical,
+            severity: Severity::Low,
+            priority: 2,
+            confidence: 0.9,
+            files: mech.iter().map(|f| f.display_path().to_string()).collect(),
+            symbols: vec![],
+            evidence: vec![Evidence::new(
+                "mechanical-bucket",
+                &format!("{total} changed lines across generated/formatting-only files"),
+                "",
+            )],
+            why: "These files match generated-output or whitespace-only heuristics. Expand to verify, but they rarely need line-by-line review.".to_string(),
+        });
+    }
+
+    // 2. Test bucket (added test files with no other signal).
+    let test_added: Vec<&FileChange> = files
+        .iter()
+        .filter(|f| {
+            f.is_test_file
+                && !f.is_generated
+                && !f.looks_formatting_only()
+                && matches!(
+                    f.status,
+                    FileStatus::Added | FileStatus::Untracked | FileStatus::Modified
+                )
+        })
+        .collect();
+    // Only bucket pure additions; modified test files get per-file items.
+    let pure_test_adds: Vec<&FileChange> = test_added
+        .iter()
+        .filter(|f| {
+            syms.iter()
+                .filter(|s| s.file == f.display_path())
+                .all(|s| matches!(s.change, SymbolChangeKind::Added))
+        })
+        .copied()
+        .collect();
+    if !pure_test_adds.is_empty() {
+        let n_syms: usize = pure_test_adds
+            .iter()
+            .map(|f| syms.iter().filter(|s| s.file == f.display_path()).count())
+            .sum();
+        items.push(ReviewItem {
+            id: "tests".to_string(),
+            title: format!(
+                "Tests — {} new test symbol{} across {} file{}",
+                n_syms,
+                if n_syms == 1 { "" } else { "s" },
+                pure_test_adds.len(),
+                if pure_test_adds.len() == 1 { "" } else { "s" }
+            ),
+            category: Category::Test,
+            severity: Severity::Low,
+            priority: 15,
+            confidence: 0.85,
+            files: pure_test_adds
+                .iter()
+                .map(|f| f.display_path().to_string())
+                .collect(),
+            symbols: vec![],
+            evidence: vec![Evidence::new(
+                "test-additions",
+                &format!("{n_syms} added test symbols"),
+                "",
+            )],
+            why: "New tests document intended behavior. Skim names for coverage of the risky items above.".to_string(),
+        });
+    }
+    let bucketed_tests: Vec<&str> = pure_test_adds.iter().map(|f| f.display_path()).collect();
+
+    // 3. Per-file items for everything else meaningful.
+    for f in files.iter().filter(|f| {
+        !f.is_generated && !f.looks_formatting_only() && !bucketed_tests.contains(&f.display_path())
+    }) {
+        let path = f.display_path();
+        let fsyms: &[&SymbolChange] = sym_by_file.get(path).map(|v| v.as_slice()).unwrap_or(&[]);
+        // Skip test files whose only changes are additions already bucketed.
+        if f.is_test_file
+            && !fsyms.is_empty()
+            && fsyms
+                .iter()
+                .all(|s| matches!(s.change, SymbolChangeKind::Added))
+        {
+            continue;
+        }
+        // Skip files with zero signal (e.g. binary with no parse).
+        if fsyms.is_empty() && f.added_lines + f.deleted_lines == 0 {
+            continue;
+        }
+        let sc = score_file(f, fsyms);
+        let title = file_title(f, fsyms);
+        let why = file_why(f, fsyms, &sc);
+        items.push(ReviewItem {
+            id: format!("file:{}", path),
+            title,
+            category: sc.category,
+            severity: sc.severity,
+            priority: sc.priority,
+            confidence: 0.8,
+            files: vec![path.to_string()],
+            symbols: fsyms.iter().map(|s| s.name.clone()).collect(),
+            evidence: sc.reasons,
+            why,
+        });
+    }
+
+    // Sort: severity desc, then priority desc.
+    items.sort_by(|a, b| {
+        b.severity
+            .cmp(&a.severity)
+            .then(b.priority.cmp(&a.priority))
+            .then(a.title.cmp(&b.title))
+    });
+    items
+}
+
+fn file_title(f: &FileChange, syms: &[&SymbolChange]) -> String {
+    let p = f.display_path();
+    if syms.len() == 1 {
+        let s = syms[0];
+        let verb = match s.change {
+            SymbolChangeKind::Added => "added",
+            SymbolChangeKind::Removed => "removed",
+            SymbolChangeKind::SignatureChanged => "signature changed",
+            SymbolChangeKind::VisibilityChanged => "visibility changed",
+            SymbolChangeKind::Renamed => "renamed",
+            SymbolChangeKind::Moved => "moved",
+            SymbolChangeKind::Modified => "modified",
+            SymbolChangeKind::FormattingOnly => "reformatted",
+        };
+        return format!("{p} — {} {verb}", s.name);
+    }
+    if !syms.is_empty() {
+        return format!("{p} — {} symbols changed", syms.len());
+    }
+    match f.status {
+        FileStatus::Added | FileStatus::Untracked => format!("{p} — new file"),
+        FileStatus::Deleted => format!("{p} — deleted"),
+        FileStatus::Renamed => format!("{} → {} — renamed", f.old_path, f.new_path),
+        _ => format!("{p} — +{} −{}", f.added_lines, f.deleted_lines),
+    }
+}
+
+fn file_why(f: &FileChange, syms: &[&SymbolChange], sc: &Score) -> String {
+    let _ = sc;
+    if syms.is_empty() {
+        return format!(
+            "No parseable symbols changed in this file ({}). Review the raw diff.",
+            f.display_path()
+        );
+    }
+    let mut parts = Vec::new();
+    for s in syms.iter().take(5) {
+        parts.push(format!("{:?} {} ({:?})", s.kind, s.name, s.change));
+    }
+    if syms.len() > 5 {
+        parts.push(format!("…and {} more", syms.len() - 5));
+    }
+    parts.join("; ")
+}
+
+/// Remove `"..."` / raw-string literal contents and `//` comments so keyword
+/// heuristics don't fire on code that merely *mentions* a keyword inside a
+/// string, test fixture, or comment (e.g. an evidence label like
+/// "new `unsafe` code" must not count as new unsafe code).
+fn strip_string_literals(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        // Line comment (outside any literal): drop the rest.
+        if c == '/' && i + 1 < bytes.len() && bytes[i + 1] == '/' {
+            break;
+        }
+        // Raw string r"..." / r#"..."# / r##"..."##.
+        if c == 'r' {
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j] == '#' {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == '"' {
+                let hashes = j - (i + 1);
+                j += 1;
+                while j < bytes.len() {
+                    if bytes[j] == '"' && bytes[j + 1..].starts_with(&vec!['#'; hashes]) {
+                        j += 1 + hashes;
+                        break;
+                    }
+                    j += 1;
+                }
+                i = j;
+                continue;
+            }
+        }
+        // Ordinary string.
+        if c == '"' {
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == '\\' {
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == '"' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rift_core::{FileStatus, Language};
+
+    fn fc(path: &str, added: &str, deleted: &str) -> FileChange {
+        FileChange {
+            old_path: path.to_string(),
+            new_path: path.to_string(),
+            status: FileStatus::Modified,
+            language: Language::from_path(path),
+            is_binary: false,
+            is_generated: false,
+            is_test_file: false,
+            added_lines: 1,
+            deleted_lines: 1,
+            hunks: vec![rift_core::Hunk {
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 1,
+                header: String::new(),
+                lines: vec![
+                    rift_core::DiffLine {
+                        kind: rift_core::DiffLineKind::Deletion,
+                        text: deleted.to_string(),
+                    },
+                    rift_core::DiffLine {
+                        kind: rift_core::DiffLineKind::Addition,
+                        text: added.to_string(),
+                    },
+                ],
+            }],
+            old_content: None,
+            new_content: None,
+        }
+    }
+
+    #[test]
+    fn auth_scores_high() {
+        let f = fc("src/auth/session.rs", "x", "y");
+        let s = score_file(&f, &[]);
+        assert!(s.priority >= 55);
+        assert_eq!(s.category, Category::Auth);
+    }
+
+    #[test]
+    fn lockfile_is_mechanical() {
+        let mut files = vec![fc("Cargo.lock", "x", "y")];
+        mark_generated(&mut files);
+        assert!(files[0].is_generated);
+    }
+
+    #[test]
+    fn string_mentions_are_not_signals() {
+        assert_eq!(
+            strip_string_literals(r#"ev("unsafe", "new `unsafe` code")"#),
+            "ev(, )"
+        );
+        assert_eq!(strip_string_literals("// unsafe fn commented"), "");
+        assert_eq!(
+            strip_string_literals("let x = 1; // unsafe here"),
+            "let x = 1; "
+        );
+        // A file whose only "unsafe" is inside string literals scores low.
+        let f = fc("src/plain.rs", r#"let s = "unsafe fn nope";"#, "let s = 1;");
+        let s = score_file(&f, &[]);
+        assert!(s.priority < 55, "priority was {}", s.priority);
+    }
+}

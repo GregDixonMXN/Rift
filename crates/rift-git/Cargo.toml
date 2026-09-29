@@ -1,0 +1,10 @@
+[package]
+name = "rift-git"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rift-core = { path = "../rift-core" }
+git2 = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
