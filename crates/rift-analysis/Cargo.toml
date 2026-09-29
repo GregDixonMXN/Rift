@@ -6,13 +6,13 @@ edition = "2021"
 [dependencies]
 rift-core = { path = "../rift-core" }
 rift-parser = { path = "../rift-parser" }
+rift-git = { path = "../rift-git" }
 anyhow = { workspace = true }
 rayon = { workspace = true }
 serde = { workspace = true }
 similar = { workspace = true }
 
 [dev-dependencies]
-rift-git = { path = "../rift-git" }
 git2 = { workspace = true }
 tempfile = { workspace = true }
 criterion = { workspace = true }

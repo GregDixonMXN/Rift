@@ -452,6 +452,127 @@ fn extract_generic(path: &str, content: &str) -> Vec<Symbol> {
     out
 }
 
+/// Call-site names inside a body: identifiers immediately followed by `(`.
+/// Used to link tests to the symbols they exercise. Keywords and obvious
+/// non-calls are filtered; the result is sorted and deduplicated.
+pub fn called_names(body: &str) -> Vec<String> {
+    let chars: Vec<char> = body.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_alphabetic() || c == '_' {
+            let start = i;
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            let name: String = chars[start..i].iter().collect();
+            if chars.get(i) == Some(&'(') && !is_call_keyword(&name) && !name.starts_with('_') {
+                out.push(name);
+            }
+            continue;
+        }
+        i += 1;
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn is_call_keyword(name: &str) -> bool {
+    matches!(
+        name,
+        "if" | "else"
+            | "for"
+            | "while"
+            | "loop"
+            | "match"
+            | "return"
+            | "use"
+            | "mod"
+            | "fn"
+            | "struct"
+            | "enum"
+            | "impl"
+            | "trait"
+            | "const"
+            | "static"
+            | "let"
+            | "mut"
+            | "ref"
+            | "move"
+            | "where"
+            | "async"
+            | "await"
+            | "crate"
+            | "self"
+            | "Self"
+            | "super"
+            | "extern"
+            | "macro"
+            | "function"
+            | "class"
+            | "extends"
+            | "new"
+            | "typeof"
+            | "instanceof"
+            | "in"
+            | "of"
+            | "do"
+            | "switch"
+            | "case"
+            | "try"
+            | "catch"
+            | "finally"
+            | "throw"
+            | "def"
+            | "lambda"
+            | "import"
+            | "from"
+            | "with"
+            | "as"
+            | "assert"
+            | "sizeof"
+            | "true"
+            | "false"
+            | "print"
+            | "println"
+    )
+}
+
+/// Does a test name target a symbol? `test_login`, `login_test`,
+/// `testLogin`, `TestLogin` all target `login` (case-insensitive).
+/// Bare affixes without a separator only count on a camel boundary, so
+/// `testing` is not a test for `ing`.
+pub fn test_targets(test_name: &str, symbol_name: &str) -> bool {
+    if test_name.eq_ignore_ascii_case(symbol_name) {
+        return true;
+    }
+    let want = symbol_name.to_lowercase();
+    let mut cores: Vec<&str> = Vec::new();
+    for p in ["test_", "should_"] {
+        if let Some(r) = test_name.strip_prefix(p) {
+            cores.push(r);
+        }
+    }
+    if let Some(r) = test_name.strip_suffix("_test") {
+        cores.push(r);
+    }
+    for p in ["test", "Test"] {
+        if let Some(r) = test_name.strip_prefix(p) {
+            if r.starts_with(|c: char| c.is_ascii_uppercase()) {
+                cores.push(r);
+            }
+        }
+    }
+    if let Some(r) = test_name.strip_suffix("Test") {
+        if !r.is_empty() {
+            cores.push(r);
+        }
+    }
+    cores.iter().any(|c| c.eq_ignore_ascii_case(&want))
+}
+
 fn generic_line(path: &str, t: &str, ln: u32) -> Option<Symbol> {
     let mk = |name: String, kind: SymbolKind, sig: String| Symbol {
         name: name.clone(),
@@ -772,5 +893,26 @@ mod tests {
         let d = diff_symbols("x.rs", &o, &n, Some(old), Some(new));
         assert_eq!(d.len(), 1, "only b changed: {d:?}");
         assert_eq!(d[0].name, "b");
+    }
+
+    #[test]
+    fn called_names_finds_calls_not_keywords() {
+        let body = "if ready {\n    let v = login(user);\n    store.save(v);\n    return v;\n}";
+        let calls = called_names(body);
+        assert!(calls.contains(&"login".to_string()), "{calls:?}");
+        assert!(calls.contains(&"save".to_string()), "{calls:?}");
+        assert!(!calls.contains(&"if".to_string()), "{calls:?}");
+        assert!(!calls.contains(&"return".to_string()), "{calls:?}");
+    }
+
+    #[test]
+    fn test_target_patterns() {
+        assert!(test_targets("test_login", "login"));
+        assert!(test_targets("login_test", "login"));
+        assert!(test_targets("testLogin", "login"));
+        assert!(test_targets("TestLogin", "login"));
+        assert!(test_targets("should_reject_expired", "reject_expired"));
+        assert!(!test_targets("test_login", "logout"));
+        assert!(!test_targets("testing", "ing"));
     }
 }

@@ -2,10 +2,10 @@
 //! No LLM, no randomness: every score traces to evidence.
 
 use rift_core::{
-    Category, ChangeSet, Evidence, FileChange, FileStatus, ReviewItem, Severity, SymbolChange,
-    SymbolChangeKind, SymbolKind,
+    Category, ChangeSet, Evidence, FileChange, FileStatus, Language, ReviewItem, Severity,
+    SymbolChange, SymbolChangeKind, SymbolKind,
 };
-use rift_parser::{diff_symbols, extract_symbols};
+use rift_parser::{called_names, diff_symbols, extract_symbols, test_targets};
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
@@ -13,7 +13,7 @@ use std::collections::HashMap;
 // ---------------------------------------------------------------------------
 
 pub fn analyze(
-    _repo_root: &str,
+    repo_root: &str,
     _base_ref: &str,
     _head_ref: &str,
     files: &mut [FileChange],
@@ -34,7 +34,8 @@ pub fn analyze(
     // Relocation reads as relocation: link cross-file moves and reorders
     // before grouping so delete+add pairs become Moved entries.
     let sym_changes = link_moves(files, sym_changes);
-    let items = group_items(files, &sym_changes);
+    let mut items = group_items(files, &sym_changes);
+    apply_test_coverage(files, &sym_changes, &mut items, repo_root);
     (sym_changes, items)
 }
 
@@ -447,6 +448,205 @@ fn link_exact_pair(r: &SymbolChange, a: &SymbolChange) -> SymbolChange {
         old_lines: r.old_lines,
         new_lines: a.new_lines,
         evidence,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test coverage linking
+// ---------------------------------------------------------------------------
+
+struct TestInfo {
+    name: String,
+    file: String,
+    calls: Vec<String>,
+}
+
+/// Test symbols from unchanged worktree files. Bounded (file count + size),
+/// deterministic (sorted traversal), and skips files already in the diff.
+/// Coverage resolves against the worktree even when reviewing old commits.
+fn scan_worktree_tests(root: &str, files: &[FileChange]) -> Vec<TestInfo> {
+    const MAX_SCAN_FILES: usize = 200;
+    const MAX_SCAN_BYTES: u64 = 256 * 1024;
+    const SKIP_DIRS: [&str; 9] = [
+        ".git",
+        "node_modules",
+        "target",
+        "dist",
+        "build",
+        "out",
+        "vendor",
+        "__pycache__",
+        ".venv",
+    ];
+    let mut out = Vec::new();
+    if root.is_empty() {
+        return out;
+    }
+    let root_path = std::path::Path::new(root);
+    if !root_path.is_dir() {
+        return out;
+    }
+    let in_diff: std::collections::HashSet<&str> = files.iter().map(|f| f.display_path()).collect();
+    let mut stack = vec![root_path.to_path_buf()];
+    let mut scanned = 0;
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().to_string();
+            if p.is_dir() {
+                if !name.starts_with('.') && !SKIP_DIRS.contains(&name.as_str()) {
+                    stack.push(p);
+                }
+                continue;
+            }
+            let rel = p
+                .strip_prefix(root_path)
+                .map(|r| r.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
+            if rel.is_empty() || in_diff.contains(rel.as_str()) {
+                continue;
+            }
+            if !rift_git::is_test_path(&rel) {
+                continue;
+            }
+            if scanned >= MAX_SCAN_FILES {
+                return out;
+            }
+            let Ok(meta) = e.metadata() else { continue };
+            if meta.len() > MAX_SCAN_BYTES {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&p) else {
+                continue;
+            };
+            scanned += 1;
+            let lang = Language::from_path(&rel);
+            for s in extract_symbols(&rel, lang, &content) {
+                if !s.is_test {
+                    continue;
+                }
+                let body =
+                    symbol_body(&content, Some((s.start_line, s.end_line))).unwrap_or_default();
+                out.push(TestInfo {
+                    name: s.name.clone(),
+                    file: rel.clone(),
+                    calls: called_names(&body),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Link changed symbols to the tests that exercise them.
+///
+/// Every test symbol in the new tree contributes its call sites; a changed
+/// symbol is covered when a test calls it by name or targets it by naming
+/// convention. Covered file items gain `covering-tests` evidence;
+/// behavior-grade items with no coverage gain an `untested-change` flag.
+/// Runs after grouping; the UI worker applies the same step.
+pub fn apply_test_coverage(
+    files: &[FileChange],
+    syms: &[SymbolChange],
+    items: &mut [ReviewItem],
+    repo_root: &str,
+) {
+    let mut tests: Vec<TestInfo> = Vec::new();
+    for f in files {
+        let path = f.display_path();
+        let Some(content) = f.new_content.as_deref() else {
+            continue;
+        };
+        for s in extract_symbols(path, f.language, content) {
+            if !(s.is_test || f.is_test_file) {
+                continue;
+            }
+            let body = symbol_body(content, Some((s.start_line, s.end_line))).unwrap_or_default();
+            tests.push(TestInfo {
+                name: s.name.clone(),
+                file: path.to_string(),
+                calls: called_names(&body),
+            });
+        }
+    }
+    // Unchanged worktree test files still cover changed symbols.
+    tests.extend(scan_worktree_tests(repo_root, files));
+    if tests.is_empty() {
+        return;
+    }
+    let test_names: Vec<&str> = tests.iter().map(|t| t.name.as_str()).collect();
+    let test_file: HashMap<&str, bool> = files
+        .iter()
+        .map(|f| (f.display_path(), f.is_test_file))
+        .collect();
+
+    // (file, symbol) -> covering "name (file)" labels.
+    let mut covering: HashMap<(String, String), Vec<String>> = HashMap::new();
+    for s in syms {
+        if matches!(s.kind, SymbolKind::Module) {
+            continue;
+        }
+        if test_file.get(s.file.as_str()).copied().unwrap_or(false)
+            || test_names.iter().any(|t| *t == s.name)
+        {
+            continue; // the change itself is a test
+        }
+        let mut cov: Vec<String> = tests
+            .iter()
+            .filter(|t| t.calls.iter().any(|c| c == &s.name) || test_targets(&t.name, &s.name))
+            .map(|t| format!("{} ({})", t.name, t.file))
+            .collect();
+        cov.sort();
+        cov.dedup();
+        if !cov.is_empty() {
+            covering.insert((s.file.clone(), s.name.clone()), cov);
+        }
+    }
+
+    for item in items.iter_mut().filter(|i| i.id.starts_with("file:")) {
+        let Some(path) = item.files.first() else {
+            continue;
+        };
+        let mut cov: Vec<String> = Vec::new();
+        for sym_name in &item.symbols {
+            // Renames read "old → new": coverage follows the new name.
+            let name = sym_name.rsplit(" → ").next().unwrap_or(sym_name);
+            if let Some(c) = covering.get(&(path.clone(), name.to_string())) {
+                cov.extend(c.iter().cloned());
+            }
+        }
+        cov.sort();
+        cov.dedup();
+        if cov.is_empty() {
+            if matches!(
+                item.category,
+                Category::Behavior
+                    | Category::Security
+                    | Category::ApiBreak
+                    | Category::Auth
+                    | Category::Schema
+                    | Category::Migration
+            ) {
+                item.evidence.push(Evidence::new(
+                    "untested-change",
+                    "no test references these symbols",
+                    path,
+                ));
+                item.why
+                    .push_str(" No covering tests reference these symbols.");
+            }
+        } else {
+            item.evidence.push(Evidence::new(
+                "covering-tests",
+                &format!("covered by {}", cov.join(", ")),
+                path,
+            ));
+        }
     }
 }
 
@@ -897,30 +1097,67 @@ pub fn group_items(files: &[FileChange], syms: &[SymbolChange]) -> Vec<ReviewIte
                 )
         })
         .collect();
-    // Only bucket pure additions; modified test files get per-file items.
+    // Only bucket additive test changes; removed/broken tests get per-file items.
     let pure_test_adds: Vec<&FileChange> = test_added
         .iter()
         .filter(|f| {
-            syms.iter()
-                .filter(|s| s.file == f.display_path())
-                .all(|s| matches!(s.change, SymbolChangeKind::Added))
+            syms.iter().filter(|s| s.file == f.display_path()).all(|s| {
+                matches!(
+                    s.change,
+                    SymbolChangeKind::Added | SymbolChangeKind::Modified
+                )
+            })
         })
         .copied()
         .collect();
     if !pure_test_adds.is_empty() {
-        let n_syms: usize = pure_test_adds
+        let n_added: usize = pure_test_adds
             .iter()
-            .map(|f| syms.iter().filter(|s| s.file == f.display_path()).count())
+            .map(|f| {
+                syms.iter()
+                    .filter(|s| {
+                        s.file == f.display_path() && matches!(s.change, SymbolChangeKind::Added)
+                    })
+                    .count()
+            })
             .sum();
+        let modified: Vec<(&str, &str)> = pure_test_adds
+            .iter()
+            .flat_map(|f| {
+                syms.iter()
+                    .filter(|s| {
+                        s.file == f.display_path() && matches!(s.change, SymbolChangeKind::Modified)
+                    })
+                    .map(|s| (s.name.as_str(), s.file.as_str()))
+            })
+            .collect();
+        let mut title = if n_added > 0 {
+            format!(
+                "Tests — {n_added} new test symbol{}",
+                if n_added == 1 { "" } else { "s" }
+            )
+        } else {
+            "Tests".to_string()
+        };
+        if !modified.is_empty() {
+            title.push_str(&format!(", {} modified", modified.len()));
+        }
+        title.push_str(&format!(
+            " across {} file{}",
+            pure_test_adds.len(),
+            if pure_test_adds.len() == 1 { "" } else { "s" }
+        ));
+        let mut evidence = vec![Evidence::new(
+            "test-additions",
+            &format!("{n_added} added test symbols"),
+            "",
+        )];
+        for (name, file) in modified.iter().take(10) {
+            evidence.push(Evidence::new("test-modified", name, file));
+        }
         items.push(ReviewItem {
             id: "tests".to_string(),
-            title: format!(
-                "Tests — {} new test symbol{} across {} file{}",
-                n_syms,
-                if n_syms == 1 { "" } else { "s" },
-                pure_test_adds.len(),
-                if pure_test_adds.len() == 1 { "" } else { "s" }
-            ),
+            title,
             category: Category::Test,
             severity: Severity::Low,
             priority: 15,
@@ -930,12 +1167,8 @@ pub fn group_items(files: &[FileChange], syms: &[SymbolChange]) -> Vec<ReviewIte
                 .map(|f| f.display_path().to_string())
                 .collect(),
             symbols: vec![],
-            evidence: vec![Evidence::new(
-                "test-additions",
-                &format!("{n_syms} added test symbols"),
-                "",
-            )],
-            why: "New tests document intended behavior. Skim names for coverage of the risky items above.".to_string(),
+            evidence,
+            why: "New tests document intended behavior. Modified tests changed what they assert — check the diffs if their targets are in the queue above.".to_string(),
         });
     }
     let bucketed_tests: Vec<&str> = pure_test_adds.iter().map(|f| f.display_path()).collect();
@@ -1023,12 +1256,15 @@ pub fn group_items(files: &[FileChange], syms: &[SymbolChange]) -> Vec<ReviewIte
             // Pair-covered moves live in their move item, not here.
             .filter(|s| !(matches!(s.change, SymbolChangeKind::Moved) && move_origin(s).is_some()))
             .collect();
-        // Skip test files whose only changes are additions already bucketed.
+        // Skip test files whose changes are all bucketed (additions/modifications).
         if f.is_test_file
             && !fsyms.is_empty()
-            && fsyms
-                .iter()
-                .all(|s| matches!(s.change, SymbolChangeKind::Added))
+            && fsyms.iter().all(|s| {
+                matches!(
+                    s.change,
+                    SymbolChangeKind::Added | SymbolChangeKind::Modified
+                )
+            })
         {
             continue;
         }
@@ -1250,7 +1486,8 @@ mod tests {
             worker_syms.extend(file_symbols(f));
         }
         let worker_syms = link_moves(&worker_files, worker_syms);
-        let worker_items = group_items(&worker_files, &worker_syms);
+        let mut worker_items = group_items(&worker_files, &worker_syms);
+        apply_test_coverage(&worker_files, &worker_syms, &mut worker_items, "");
         let worker_stats = compute_stats(&worker_files, &worker_syms, &worker_items);
 
         fn js<T: serde::Serialize>(v: &T) -> String {
@@ -1363,6 +1600,140 @@ mod tests {
                 .all(|s| !matches!(s.change, SymbolChangeKind::Moved)),
             "{syms:?}"
         );
+    }
+
+    #[test]
+    fn covering_test_links_by_call() {
+        let mut files = vec![
+            moved_fc(
+                "src/auth.rs",
+                Some("pub fn login(user: &str) -> bool {\n    false\n}\n"),
+                Some("pub fn login(user: &str) -> bool {\n    check(user)\n}\n"),
+            ),
+            moved_fc(
+                "tests/auth_test.rs",
+                Some("#[test]\nfn test_login() {\n    assert!(login(\"a\"));\n}\n"),
+                Some("#[test]\nfn test_login() {\n    assert!(login(\"a\"));\n}\n"),
+            ),
+        ];
+        files[1].is_test_file = true;
+        files[1].added_lines = 0;
+        files[1].deleted_lines = 0;
+        let (_, items) = analyze("r", "b", "h", &mut files);
+        let item = items
+            .iter()
+            .find(|i| i.id == "file:src/auth.rs")
+            .expect("auth item");
+        let ev = item
+            .evidence
+            .iter()
+            .find(|e| e.kind == "covering-tests")
+            .expect("covering evidence");
+        assert!(ev.summary.contains("test_login"), "{}", ev.summary);
+        assert!(
+            item.evidence.iter().all(|e| e.kind != "untested-change"),
+            "{item:?}"
+        );
+    }
+
+    #[test]
+    fn behavior_change_without_tests_flagged() {
+        let mut files = vec![
+            moved_fc(
+                "src/auth.rs",
+                Some("pub fn login(user: &str) -> bool {\n    false\n}\n"),
+                Some("pub fn login(user: &str) -> bool {\n    check(user)\n}\n"),
+            ),
+            moved_fc(
+                "tests/other_test.rs",
+                Some("#[test]\nfn test_other() {\n    assert!(other());\n}\n"),
+                Some("#[test]\nfn test_other() {\n    assert!(other());\n}\n"),
+            ),
+        ];
+        files[1].is_test_file = true;
+        files[1].added_lines = 0;
+        files[1].deleted_lines = 0;
+        let (_, items) = analyze("r", "b", "h", &mut files);
+        let item = items
+            .iter()
+            .find(|i| i.id == "file:src/auth.rs")
+            .expect("auth item");
+        assert!(
+            item.evidence.iter().any(|e| e.kind == "untested-change"),
+            "{item:?}"
+        );
+        assert!(item.why.contains("No covering tests"), "{}", item.why);
+    }
+
+    #[test]
+    fn tests_bucket_counts_added_and_modified() {
+        let mut added = moved_fc(
+            "tests/new_test.rs",
+            None,
+            Some("#[test]\nfn test_a() {\n    assert!(true);\n}\n\n#[test]\nfn test_b() {\n    assert!(true);\n}\n"),
+        );
+        added.status = FileStatus::Added;
+        added.is_test_file = true;
+        let mut changed = moved_fc(
+            "tests/old_test.rs",
+            Some("#[test]\nfn test_c() {\n    assert!(true);\n}\n"),
+            Some("#[test]\nfn test_c() {\n    assert!(false);\n}\n"),
+        );
+        changed.is_test_file = true;
+        let mut files = vec![added, changed];
+        let (_, items) = analyze("r", "b", "h", &mut files);
+        let bucket = items.iter().find(|i| i.id == "tests").expect("bucket");
+        assert!(
+            bucket.title.contains("2 new test symbol"),
+            "{}",
+            bucket.title
+        );
+        assert!(bucket.title.contains("1 modified"), "{}", bucket.title);
+        assert!(
+            bucket
+                .evidence
+                .iter()
+                .any(|e| e.kind == "test-modified" && e.summary == "test_c"),
+            "{bucket:?}"
+        );
+        // Both files bucketed — no per-file items for them.
+        assert!(
+            items.iter().all(|i| !i.id.starts_with("file:tests/")),
+            "{items:?}"
+        );
+    }
+
+    #[test]
+    fn unchanged_worktree_tests_cover() {
+        // Covering test lives outside the diff: resolved via worktree scan.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("tests")).unwrap();
+        std::fs::write(
+            dir.path().join("tests/auth_test.rs"),
+            "#[test]\nfn test_login() {\n    assert!(login(\"a\"));\n}\n",
+        )
+        .unwrap();
+        let mut files = vec![moved_fc(
+            "src/auth.rs",
+            Some("pub fn login(user: &str) -> bool {\n    false\n}\n"),
+            Some("pub fn login(user: &str) -> bool {\n    check(user)\n}\n"),
+        )];
+        mark_generated(&mut files);
+        let syms: Vec<SymbolChange> = files.iter().flat_map(file_symbols).collect();
+        let syms = link_moves(&files, syms);
+        let mut items = group_items(&files, &syms);
+        apply_test_coverage(&files, &syms, &mut items, dir.path().to_str().unwrap());
+        let item = items
+            .iter()
+            .find(|i| i.id == "file:src/auth.rs")
+            .expect("auth item");
+        let ev = item
+            .evidence
+            .iter()
+            .find(|e| e.kind == "covering-tests")
+            .expect("covering evidence");
+        assert!(ev.summary.contains("test_login"), "{}", ev.summary);
+        assert!(ev.summary.contains("tests/auth_test.rs"), "{}", ev.summary);
     }
 
     #[test]

@@ -218,6 +218,7 @@ pub fn run_native_progressive(
     // Analysis worker: per-file symbols (progress) then grouping + stats.
     {
         let wfiles = Arc::clone(&files);
+        let wroot = repo_root.clone();
         std::thread::spawn(move || {
             let mut syms_all = Vec::new();
             for (i, f) in wfiles.iter().enumerate() {
@@ -227,7 +228,8 @@ pub fn run_native_progressive(
                 }
             }
             let syms_all = rift_analysis::link_moves(&wfiles, syms_all);
-            let items = rift_analysis::group_items(&wfiles, &syms_all);
+            let mut items = rift_analysis::group_items(&wfiles, &syms_all);
+            rift_analysis::apply_test_coverage(&wfiles, &syms_all, &mut items, &wroot);
             let stats = rift_analysis::compute_stats(&wfiles, &syms_all, &items);
             let _ = tx.send(UiMsg::Finished {
                 items,
