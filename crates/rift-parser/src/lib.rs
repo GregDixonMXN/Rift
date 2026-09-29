@@ -3,6 +3,7 @@
 
 use rift_core::{Language, Symbol, SymbolChange, SymbolChangeKind, SymbolKind};
 use std::collections::HashMap;
+use syn::spanned::Spanned;
 
 // ---------------------------------------------------------------------------
 // Extraction
@@ -41,7 +42,7 @@ fn collect_rust_item(path: &str, item: &syn::Item, impl_ctx: Option<&str>, out: 
                         .map(|s| s.ident == "test")
                         .unwrap_or(false)
             });
-            let (s, e) = span_lines(&f.sig.ident, &f.block);
+            let (s, e) = fn_body_lines(&f.sig, &f.block);
             out.push(Symbol {
                 name: if let Some(ctx) = impl_ctx {
                     format!("{ctx}::{name}")
@@ -64,7 +65,8 @@ fn collect_rust_item(path: &str, item: &syn::Item, impl_ctx: Option<&str>, out: 
             });
         }
         Item::Struct(s) => {
-            let (sl, el) = (ident_line(&s.ident), ident_line(&s.ident));
+            let sl = ident_line(&s.ident);
+            let el = struct_end(s, sl);
             out.push(Symbol {
                 name: s.ident.to_string(),
                 kind: SymbolKind::Struct,
@@ -82,7 +84,7 @@ fn collect_rust_item(path: &str, item: &syn::Item, impl_ctx: Option<&str>, out: 
                 kind: SymbolKind::Enum,
                 file: path.to_string(),
                 start_line: ident_line(&e.ident),
-                end_line: ident_line(&e.ident),
+                end_line: brace_end(&e.brace_token.span, ident_line(&e.ident)),
                 signature: format!("enum {}", e.ident),
                 is_test: false,
                 is_public: matches!(e.vis, syn::Visibility::Public(_)),
@@ -94,7 +96,7 @@ fn collect_rust_item(path: &str, item: &syn::Item, impl_ctx: Option<&str>, out: 
                 kind: SymbolKind::Trait,
                 file: path.to_string(),
                 start_line: ident_line(&t.ident),
-                end_line: ident_line(&t.ident),
+                end_line: brace_end(&t.brace_token.span, ident_line(&t.ident)),
                 signature: format!("trait {}", t.ident),
                 is_test: false,
                 is_public: matches!(t.vis, syn::Visibility::Public(_)),
@@ -106,6 +108,7 @@ fn collect_rust_item(path: &str, item: &syn::Item, impl_ctx: Option<&str>, out: 
                 if let syn::ImplItem::Fn(m) = inner {
                     let name = m.sig.ident.to_string();
                     let is_test = m.attrs.iter().any(|a| a.path().is_ident("test"));
+                    let (ms, me) = fn_body_lines(&m.sig, &m.block);
                     out.push(Symbol {
                         name: format!("{ctx}::{name}"),
                         kind: if is_test {
@@ -114,8 +117,8 @@ fn collect_rust_item(path: &str, item: &syn::Item, impl_ctx: Option<&str>, out: 
                             SymbolKind::Method
                         },
                         file: path.to_string(),
-                        start_line: 0,
-                        end_line: 0,
+                        start_line: ms,
+                        end_line: me,
                         signature: fn_sig(&m.sig),
                         is_test,
                         is_public: matches!(m.vis, syn::Visibility::Public(_)),
@@ -129,7 +132,7 @@ fn collect_rust_item(path: &str, item: &syn::Item, impl_ctx: Option<&str>, out: 
                 kind: SymbolKind::Const,
                 file: path.to_string(),
                 start_line: ident_line(&c.ident),
-                end_line: ident_line(&c.ident),
+                end_line: token_end(c.semi_token.span(), ident_line(&c.ident)),
                 signature: format!("const {}", c.ident),
                 is_test: false,
                 is_public: matches!(c.vis, syn::Visibility::Public(_)),
@@ -141,7 +144,7 @@ fn collect_rust_item(path: &str, item: &syn::Item, impl_ctx: Option<&str>, out: 
                 kind: SymbolKind::Static,
                 file: path.to_string(),
                 start_line: ident_line(&s.ident),
-                end_line: ident_line(&s.ident),
+                end_line: token_end(s.semi_token.span(), ident_line(&s.ident)),
                 signature: format!("static {}", s.ident),
                 is_test: false,
                 is_public: matches!(s.vis, syn::Visibility::Public(_)),
@@ -153,7 +156,7 @@ fn collect_rust_item(path: &str, item: &syn::Item, impl_ctx: Option<&str>, out: 
                 kind: SymbolKind::Module,
                 file: path.to_string(),
                 start_line: ident_line(&m.ident),
-                end_line: ident_line(&m.ident),
+                end_line: mod_end(m, ident_line(&m.ident)),
                 signature: format!("mod {}", m.ident),
                 is_test: m.ident == "tests" || is_test_mod(m),
                 is_public: matches!(m.vis, syn::Visibility::Public(_)),
@@ -191,10 +194,41 @@ fn ident_line(i: &syn::Ident) -> u32 {
     i.span().start().line as u32
 }
 
-fn span_lines(start: &syn::Ident, _block: &syn::Block) -> (u32, u32) {
-    // proc-macro2 spans from parsing a string are file-local but line-accurate.
-    let s = start.span().start().line as u32;
-    (s, s)
+/// Clamp a token end-line to its item start (defensive: spans are file-local
+/// but never backwards).
+fn token_end(sp: proc_macro2::Span, fallback: u32) -> u32 {
+    (sp.end().line as u32).max(fallback)
+}
+
+fn brace_end(span: &proc_macro2::extra::DelimSpan, fallback: u32) -> u32 {
+    token_end(span.close(), fallback)
+}
+
+/// Exact (start, end) lines for a free function or method.
+fn fn_body_lines(sig: &syn::Signature, block: &syn::Block) -> (u32, u32) {
+    let s = sig.ident.span().start().line as u32;
+    (s, brace_end(&block.brace_token.span, s))
+}
+
+fn struct_end(s: &syn::ItemStruct, fallback: u32) -> u32 {
+    match &s.fields {
+        syn::Fields::Named(f) => brace_end(&f.brace_token.span, fallback),
+        syn::Fields::Unnamed(f) => brace_end(&f.paren_token.span, fallback),
+        syn::Fields::Unit => s
+            .semi_token
+            .map(|t| token_end(t.span(), fallback))
+            .unwrap_or(fallback),
+    }
+}
+
+fn mod_end(m: &syn::ItemMod, fallback: u32) -> u32 {
+    if let Some((brace, _)) = &m.content {
+        brace_end(&brace.span, fallback)
+    } else {
+        m.semi
+            .map(|t| token_end(t.span(), fallback))
+            .unwrap_or(fallback)
+    }
 }
 
 fn fn_sig(sig: &syn::Signature) -> String {
@@ -649,20 +683,22 @@ fn bodies_differ(old_body: Option<&str>, new_body: Option<&str>, os: &Symbol, ns
         }
         lines[a..b].join("\n")
     };
-    let o = slice(
-        &old_lines,
-        os.start_line,
-        os.end_line.max(os.start_line + 5),
-    );
-    let n = slice(
-        &new_lines,
-        ns.start_line,
-        ns.end_line.max(ns.start_line + 5),
-    );
+    let o = slice(&old_lines, os.start_line, padded_end(os));
+    let n = slice(&new_lines, ns.start_line, padded_end(ns));
     if o.is_empty() || n.is_empty() {
         return false;
     }
     normalize(&o) != normalize(&n)
+}
+
+/// End line for body comparison: exact multi-line ranges compare as-is;
+/// single-line/unknown ranges get a small window so nearby edits still count.
+fn padded_end(s: &Symbol) -> u32 {
+    if s.end_line > s.start_line {
+        s.end_line
+    } else {
+        s.start_line + 5
+    }
 }
 
 fn normalize(s: &str) -> String {
@@ -733,5 +769,18 @@ mod tests {
         let src = "def test_login():\n    pass\n";
         let s = extract_symbols("t.py", Language::Python, src);
         assert!(s.iter().any(|x| x.is_test));
+    }
+
+    #[test]
+    fn adjacent_unchanged_fn_is_quiet() {
+        let old = "pub fn a() -> i32 {\n    1\n}\n\npub fn b() -> i32 {\n    2\n}\n";
+        let new = "pub fn a() -> i32 {\n    1\n}\n\npub fn b() -> i32 {\n    3\n}\n";
+        let o = extract_symbols("x.rs", Language::Rust, old);
+        let n = extract_symbols("x.rs", Language::Rust, new);
+        let ao = o.iter().find(|s| s.name == "a").expect("fn a");
+        assert_eq!((ao.start_line, ao.end_line), (1, 3));
+        let d = diff_symbols("x.rs", &o, &n, Some(old), Some(new));
+        assert_eq!(d.len(), 1, "only b changed: {d:?}");
+        assert_eq!(d[0].name, "b");
     }
 }

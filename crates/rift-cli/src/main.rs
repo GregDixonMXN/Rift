@@ -57,20 +57,28 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let cs = build_changeset(&args)?;
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&cs)?);
+    // GUI path streams analysis progressively (window first, results land
+    // live). Batch paths (--json/--overview) analyze up front.
+    let batch = args.json || args.overview || args.no_gui;
+    if batch {
+        let cs = build_changeset(&args)?;
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&cs)?);
+        } else {
+            print!("{}", rift_ui::render_text_overview(&cs));
+        }
         return Ok(());
     }
-    if args.overview || args.no_gui {
-        print!("{}", rift_ui::render_text_overview(&cs));
-        return Ok(());
-    }
+    let engine = rift_git::GitEngine::discover(&args.path)
+        .with_context(|| format!("could not open repository at {}", args.path.display()))?;
+    let root = engine.root.to_string_lossy().replace('\\', "/");
+    let (files, base_ref, head_ref) = resolve_files(&engine, &args)?;
     // GUI first; fall back to text when headless.
-    match rift_ui::run_native(cs.clone()) {
+    match rift_ui::run_native_progressive(root, base_ref, head_ref, files) {
         Ok(_) => Ok(()),
         Err(e) => {
             eprintln!("rift: GUI unavailable ({e}); printing overview instead.\n");
+            let cs = build_changeset(&args)?;
             print!("{}", rift_ui::render_text_overview(&cs));
             Ok(())
         }
@@ -82,29 +90,8 @@ fn build_changeset(args: &Args) -> Result<ChangeSet> {
         .with_context(|| format!("could not open repository at {}", args.path.display()))?;
     let root = engine.root.to_string_lossy().replace('\\', "/");
 
-    let (files, base_ref, head_ref) = if let Some(sha) = &args.commit {
-        (
-            engine.commit_changeset(sha)?,
-            format!("{sha}^"),
-            sha.clone(),
-        )
-    } else if args.staged {
-        (
-            engine.staged_changeset()?,
-            "HEAD".to_string(),
-            "index (staged)".to_string(),
-        )
-    } else if !args.revs.is_empty() {
-        parse_revs(&engine, &args.revs, &args.rev2)?
-    } else {
-        (
-            engine.worktree_changeset(args.untracked)?,
-            "HEAD".to_string(),
-            format!("worktree ({})", engine.head_short()),
-        )
-    };
+    let (mut files, base_ref, head_ref) = resolve_files(&engine, args)?;
 
-    let mut files = files;
     let (syms, items) = rift_analysis::analyze(&root, &base_ref, &head_ref, &mut files);
     let mut cs = ChangeSet {
         repo_root: root,
@@ -117,6 +104,35 @@ fn build_changeset(args: &Args) -> Result<ChangeSet> {
     };
     rift_analysis::fill_stats(&mut cs);
     Ok(cs)
+}
+
+/// Git file list + ref labels, without any symbol analysis.
+fn resolve_files(
+    engine: &rift_git::GitEngine,
+    args: &Args,
+) -> Result<(Vec<rift_core::FileChange>, String, String)> {
+    if let Some(sha) = &args.commit {
+        return Ok((
+            engine.commit_changeset(sha)?,
+            format!("{sha}^"),
+            sha.clone(),
+        ));
+    }
+    if args.staged {
+        return Ok((
+            engine.staged_changeset()?,
+            "HEAD".to_string(),
+            "index (staged)".to_string(),
+        ));
+    }
+    if !args.revs.is_empty() {
+        return parse_revs(engine, &args.revs, &args.rev2);
+    }
+    Ok((
+        engine.worktree_changeset(args.untracked)?,
+        "HEAD".to_string(),
+        format!("worktree ({})", engine.head_short()),
+    ))
 }
 
 fn parse_revs(

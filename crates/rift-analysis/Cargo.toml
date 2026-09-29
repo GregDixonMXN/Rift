@@ -7,6 +7,7 @@ edition = "2021"
 rift-core = { path = "../rift-core" }
 rift-parser = { path = "../rift-parser" }
 anyhow = { workspace = true }
+rayon = { workspace = true }
 serde = { workspace = true }
 similar = { workspace = true }
 
@@ -15,6 +16,7 @@ rift-git = { path = "../rift-git" }
 git2 = { workspace = true }
 tempfile = { workspace = true }
 criterion = { workspace = true }
+serde_json = { workspace = true }
 
 [[bench]]
 name = "scoring"

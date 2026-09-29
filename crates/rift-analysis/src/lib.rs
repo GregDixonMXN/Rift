@@ -19,67 +19,90 @@ pub fn analyze(
     files: &mut [FileChange],
 ) -> (Vec<SymbolChange>, Vec<ReviewItem>) {
     mark_generated(files);
-    let mut sym_changes = Vec::new();
-    for f in files.iter() {
-        if f.is_binary || f.is_generated {
-            continue;
-        }
-        let path = f.display_path();
-        let old_syms = f
-            .old_content
-            .as_deref()
-            .map(|c| extract_symbols(&f.old_path, f.language, c))
-            .unwrap_or_default();
-        let new_syms = f
-            .new_content
-            .as_deref()
-            .map(|c| extract_symbols(path, f.language, c))
-            .unwrap_or_default();
-        // For added/deleted whole files, synthesize from one side.
-        let mut d = diff_symbols(
-            path,
-            &old_syms,
-            &new_syms,
-            f.old_content.as_deref(),
-            f.new_content.as_deref(),
-        );
-        // Whole-file add/delete with no parseable symbols still deserves one entry.
-        if d.is_empty()
-            && matches!(
-                f.status,
-                FileStatus::Added | FileStatus::Deleted | FileStatus::Untracked
-            )
-            && (f.added_lines + f.deleted_lines) > 0
-        {
-            d.push(SymbolChange {
-                file: path.to_string(),
-                name: path.to_string(),
-                kind: rift_core::SymbolKind::Module,
-                change: if matches!(f.status, FileStatus::Deleted) {
-                    SymbolChangeKind::Removed
-                } else {
-                    SymbolChangeKind::Added
-                },
-                confidence: 0.9,
-                old_signature: None,
-                new_signature: None,
-                old_lines: None,
-                new_lines: None,
-                evidence: vec!["whole file added/removed".to_string()],
-            });
-        }
-        sym_changes.extend(d);
-    }
+    // Symbol work is embarrassingly parallel (pure functions of file
+    // contents); rayon keeps first paint fast on large patches. Collection
+    // order is deterministic, and grouping sorts its output, so results are
+    // identical to the sequential run.
+    use rayon::prelude::*;
+    let sym_changes: Vec<SymbolChange> = files
+        .par_iter()
+        .map(file_symbols)
+        .collect::<Vec<Vec<SymbolChange>>>()
+        .into_iter()
+        .flatten()
+        .collect();
     let items = group_items(files, &sym_changes);
     (sym_changes, items)
 }
 
+/// Symbol-level changes for one file. Pure function — safe to run on any
+/// thread, and reused by the UI's progressive worker one file at a time.
+pub fn file_symbols(f: &FileChange) -> Vec<SymbolChange> {
+    if f.is_binary || f.is_generated {
+        return Vec::new();
+    }
+    let path = f.display_path();
+    let old_syms = f
+        .old_content
+        .as_deref()
+        .map(|c| extract_symbols(&f.old_path, f.language, c))
+        .unwrap_or_default();
+    let new_syms = f
+        .new_content
+        .as_deref()
+        .map(|c| extract_symbols(path, f.language, c))
+        .unwrap_or_default();
+    // For added/deleted whole files, synthesize from one side.
+    let mut d = diff_symbols(
+        path,
+        &old_syms,
+        &new_syms,
+        f.old_content.as_deref(),
+        f.new_content.as_deref(),
+    );
+    // Whole-file add/delete with no parseable symbols still deserves one entry.
+    if d.is_empty()
+        && matches!(
+            f.status,
+            FileStatus::Added | FileStatus::Deleted | FileStatus::Untracked
+        )
+        && (f.added_lines + f.deleted_lines) > 0
+    {
+        d.push(SymbolChange {
+            file: path.to_string(),
+            name: path.to_string(),
+            kind: rift_core::SymbolKind::Module,
+            change: if matches!(f.status, FileStatus::Deleted) {
+                SymbolChangeKind::Removed
+            } else {
+                SymbolChangeKind::Added
+            },
+            confidence: 0.9,
+            old_signature: None,
+            new_signature: None,
+            old_lines: None,
+            new_lines: None,
+            evidence: vec!["whole file added/removed".to_string()],
+        });
+    }
+    d
+}
+
 pub fn fill_stats(cs: &mut ChangeSet) {
+    cs.stats = compute_stats(&cs.files, &cs.symbol_changes, &cs.review_items);
+}
+
+/// Stats without needing a full ChangeSet (used by the UI worker).
+pub fn compute_stats(
+    files: &[FileChange],
+    syms: &[SymbolChange],
+    items: &[ReviewItem],
+) -> rift_core::ChangeStats {
     let mut s = rift_core::ChangeStats {
-        files_changed: cs.files.len(),
+        files_changed: files.len(),
         ..Default::default()
     };
-    for f in &cs.files {
+    for f in files {
         s.added_lines += f.added_lines;
         s.deleted_lines += f.deleted_lines;
         if f.is_generated || f.looks_formatting_only() {
@@ -89,19 +112,18 @@ pub fn fill_stats(cs: &mut ChangeSet) {
             s.test_files += 1;
         }
     }
-    for sc in &cs.symbol_changes {
+    for sc in syms {
         match sc.change {
             SymbolChangeKind::Added => s.symbols_added += 1,
             SymbolChangeKind::Removed => s.symbols_removed += 1,
             _ => s.symbols_modified += 1,
         }
     }
-    s.meaningful_changes = cs
-        .review_items
+    s.meaningful_changes = items
         .iter()
         .filter(|r| !matches!(r.category, Category::Mechanical))
         .count();
-    cs.stats = s;
+    s
 }
 
 // ---------------------------------------------------------------------------
@@ -461,7 +483,7 @@ fn score_file(f: &FileChange, syms: &[&SymbolChange]) -> Score {
 // Grouping into review items
 // ---------------------------------------------------------------------------
 
-fn group_items(files: &[FileChange], syms: &[SymbolChange]) -> Vec<ReviewItem> {
+pub fn group_items(files: &[FileChange], syms: &[SymbolChange]) -> Vec<ReviewItem> {
     let mut items = Vec::new();
     let sym_by_file: HashMap<&str, Vec<&SymbolChange>> = {
         let mut m: HashMap<&str, Vec<&SymbolChange>> = HashMap::new();
@@ -747,6 +769,55 @@ mod tests {
         let s = score_file(&f, &[]);
         assert!(s.priority >= 55);
         assert_eq!(s.category, Category::Auth);
+    }
+
+    /// The UI worker's sequential recipe must match batch analyze() exactly:
+    /// same flags, same symbols, same items, same stats.
+    #[test]
+    fn worker_sequence_matches_batch() {
+        fn content_fc(path: &str, old: &str, new: &str) -> FileChange {
+            let mut f = fc(path, "+", "-");
+            f.old_content = Some(old.to_string());
+            f.new_content = Some(new.to_string());
+            f
+        }
+        let mk = || {
+            vec![
+                content_fc(
+                    "src/auth.rs",
+                    "pub const SESSION_TIMEOUT: u64 = 900;\n",
+                    "pub const SESSION_TIMEOUT: u64 = 86400;\n",
+                ),
+                content_fc(
+                    "src/util.rs",
+                    "pub fn a() -> i32 {\n1\n}\n",
+                    "pub fn a() -> i32 {\n1\n}\n",
+                ),
+            ]
+        };
+        let mut batch_files = mk();
+        let (batch_syms, batch_items) = analyze("r", "b", "h", &mut batch_files);
+        let batch_stats = compute_stats(&batch_files, &batch_syms, &batch_items);
+
+        // Worker recipe: mark -> per-file symbols -> group -> stats.
+        let mut worker_files = mk();
+        mark_generated(&mut worker_files);
+        let mut worker_syms = Vec::new();
+        for f in worker_files.iter() {
+            worker_syms.extend(file_symbols(f));
+        }
+        let worker_items = group_items(&worker_files, &worker_syms);
+        let worker_stats = compute_stats(&worker_files, &worker_syms, &worker_items);
+
+        fn js<T: serde::Serialize>(v: &T) -> String {
+            serde_json::to_string(v).unwrap()
+        }
+        assert_eq!(js(&batch_syms), js(&worker_syms));
+        assert_eq!(js(&batch_items), js(&worker_items));
+        assert_eq!(js(&batch_stats), js(&worker_stats));
+        // And the timeout change is actually caught (guards vacuous equality).
+        assert_eq!(batch_syms.len(), 1);
+        assert_eq!(batch_syms[0].name, "SESSION_TIMEOUT");
     }
 
     #[test]

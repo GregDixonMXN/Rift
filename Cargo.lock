@@ -2008,10 +2008,12 @@ dependencies = [
  "anyhow",
  "criterion",
  "git2",
+ "rayon",
  "rift-core",
  "rift-git",
  "rift-parser",
  "serde",
+ "serde_json",
  "similar",
  "tempfile",
 ]
