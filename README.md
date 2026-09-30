@@ -43,5 +43,11 @@ start tracking (`git init && git add -A && git commit -m init`).
     cargo test
     cargo clippy
 
+## License
+
+Apache-2.0 — see `LICENSE`. The deterministic core (git, parsing,
+analysis, UI) is yours to run, fork, and embed. Cloud judgment
+(`--jev`, TypeSafe API) is opt-in and billed by its provider, if at all.
+
 See `docs/ARCHITECTURE.md` for decisions and the roadmap (JEV scoring layer,
 LLM escalation, blast-radius graph).
