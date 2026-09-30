@@ -24,6 +24,7 @@ carries evidence you can drill into.
     crates/rift-analysis  deterministic importance scoring + review grouping
     crates/rift-cli       `rift` binary
     crates/rift-ui        eframe/egui native UI (Overview/Queue/Files/Diff)
+    crates/rift-jev       opt-in Jev risk/severity layer (TypeSafe API)
     docs/                 architecture notes
 
 ## Install
