@@ -2626,6 +2626,7 @@ dependencies = [
  "egui",
  "rift-analysis",
  "rift-core",
+ "rift-jev",
  "similar",
 ]
 

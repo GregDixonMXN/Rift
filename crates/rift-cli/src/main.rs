@@ -57,7 +57,6 @@ struct Args {
     /// Ask Jev (TypeSafe cloud API) for risk/severity judgments on each
     /// behavior-grade item. Requires TYPESAFE_API_KEY. Sends structured
     /// facts only (symbols, evidence summaries, counts) — never source.
-    /// Batch output only (--json/--overview/--no-gui).
     #[arg(long)]
     jev: bool,
 }
@@ -80,7 +79,14 @@ fn main() -> Result<()> {
     let root = engine.root.to_string_lossy().replace('\\', "/");
     let (files, base_ref, head_ref) = resolve_files(&engine, &args)?;
     // GUI first; fall back to text when headless.
-    match rift_ui::run_native_progressive(root, base_ref, head_ref, files) {
+    let jev_key = args
+        .jev
+        .then(|| std::env::var("TYPESAFE_API_KEY").ok())
+        .flatten();
+    if args.jev && jev_key.is_none() {
+        eprintln!("rift: --jev needs TYPESAFE_API_KEY in the environment; continuing without it");
+    }
+    match rift_ui::run_native_progressive(root, base_ref, head_ref, files, jev_key) {
         Ok(_) => Ok(()),
         Err(e) => {
             eprintln!("rift: GUI unavailable ({e}); printing overview instead.\n");
@@ -98,27 +104,23 @@ fn build_changeset(args: &Args) -> Result<ChangeSet> {
     let (mut files, base_ref, head_ref) = resolve_files(&engine, args)?;
 
     let (syms, mut items) = rift_analysis::analyze(&root, &base_ref, &head_ref, &mut files);
-    if args.jev {
-        if args.json || args.overview || args.no_gui {
-            match rift_jev::enrich(
-                &base_ref,
-                &head_ref,
-                &mut items,
-                std::env::var("TYPESAFE_API_KEY").ok().as_deref(),
-            ) {
-                rift_jev::JevStatus::Applied { items: n } => {
-                    eprintln!("rift: jev judged {n} items (structured facts only, no source sent)");
-                }
-                rift_jev::JevStatus::SkippedNoKey => {
-                    eprintln!("rift: --jev needs TYPESAFE_API_KEY in the environment; skipping");
-                }
-                rift_jev::JevStatus::SkippedNoItems => {}
-                rift_jev::JevStatus::Failed(e) => {
-                    eprintln!("rift: jev enrichment failed ({e}); review continues without it");
-                }
+    if args.jev && (args.json || args.overview || args.no_gui) {
+        match rift_jev::enrich(
+            &base_ref,
+            &head_ref,
+            &mut items,
+            std::env::var("TYPESAFE_API_KEY").ok().as_deref(),
+        ) {
+            rift_jev::JevStatus::Applied { items: n } => {
+                eprintln!("rift: jev judged {n} items (structured facts only, no source sent)");
             }
-        } else {
-            eprintln!("rift: --jev currently enriches batch output; add --overview or --json");
+            rift_jev::JevStatus::SkippedNoKey => {
+                eprintln!("rift: --jev needs TYPESAFE_API_KEY in the environment; skipping");
+            }
+            rift_jev::JevStatus::SkippedNoItems => {}
+            rift_jev::JevStatus::Failed(e) => {
+                eprintln!("rift: jev enrichment failed ({e}); review continues without it");
+            }
         }
     }
     let mut cs = ChangeSet {

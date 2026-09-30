@@ -205,6 +205,7 @@ pub fn run_native_progressive(
     base_ref: String,
     head_ref: String,
     files: Vec<FileChange>,
+    jev_key: Option<String>,
 ) -> eframe::Result<()> {
     use std::sync::Arc;
     let mut files = files;
@@ -219,6 +220,8 @@ pub fn run_native_progressive(
     {
         let wfiles = Arc::clone(&files);
         let wroot = repo_root.clone();
+        let wbase = base_ref.clone();
+        let whead = head_ref.clone();
         std::thread::spawn(move || {
             let mut syms_all = Vec::new();
             for (i, f) in wfiles.iter().enumerate() {
@@ -232,6 +235,11 @@ pub fn run_native_progressive(
             let mut items = rift_analysis::group_items(&wfiles, &syms_all);
             rift_analysis::apply_test_coverage(&wfiles, &syms_all, &mut items, &ctx);
             rift_analysis::apply_blast_radius(&wfiles, &mut items, &ctx);
+            // Opt-in Jev enrichment, same recipe as the CLI batch path.
+            // Blocking, but the window is already painted and spinning.
+            if let Some(key) = jev_key.as_deref() {
+                let _ = rift_jev::enrich(&wbase, &whead, &mut items, Some(key));
+            }
             let stats = rift_analysis::compute_stats(&wfiles, &syms_all, &items);
             let _ = tx.send(UiMsg::Finished {
                 items,
