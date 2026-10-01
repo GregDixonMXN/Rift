@@ -39,6 +39,28 @@ Puts `rift` on PATH (`~/.cargo/bin`). Then from any repo:
 Rift needs a git repository to read. Point it at one (`rift <path>`) or
 start tracking (`git init && git add -A && git commit -m init`).
 
+## Hooks and CI
+
+Gate commits on severity (batch only, exit 2 when triggered):
+
+    rift --staged --overview --fail-on high
+
+Install as a pre-commit hook (reviews what you're about to commit):
+
+    cat > .git/hooks/pre-commit <<'EOF'
+    #!/bin/sh
+    rift --staged --overview --fail-on high || {
+      echo "rift blocked this commit — review the items above." >&2
+      exit 1
+    }
+    EOF
+    chmod +x .git/hooks/pre-commit
+
+Review a pull request as a range (needs the base locally):
+
+    git fetch origin main && rift main..HEAD --overview
+    rift --staged --json --fail-on critical | jq .stats
+
 ## Build
 
     cargo build

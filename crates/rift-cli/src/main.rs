@@ -64,6 +64,11 @@ struct Args {
     /// computed locally with no API key and no network. For CI and calibration.
     #[arg(long)]
     jev_local: bool,
+
+    /// CI/hook gate (batch only): exit 2 when any meaningful review item
+    /// reaches this severity or higher. Levels: low, medium, high, critical.
+    #[arg(long, value_name = "SEVERITY")]
+    fail_on: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -77,6 +82,17 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&cs)?);
         } else {
             print!("{}", rift_ui::render_text_overview(&cs));
+        }
+        if let Some(level) = args.fail_on.as_deref() {
+            let threshold = parse_severity(level)?;
+            if let Some(hit) = gate_trigger(&cs, threshold) {
+                eprintln!(
+                    "rift: gate {level} triggered by [{}] {}",
+                    format!("{:?}", hit.severity).to_lowercase(),
+                    hit.title
+                );
+                std::process::exit(2);
+            }
         }
         return Ok(());
     }
@@ -236,4 +252,96 @@ fn parse_revs(
     // Single rev: commit vs parent.
     let files = engine.commit_changeset(r1)?;
     Ok((files, format!("{r1}^"), r1.to_string()))
+}
+
+/// Parse a `--fail-on` level. Case-insensitive; errors list the valid levels.
+fn parse_severity(level: &str) -> Result<rift_core::Severity> {
+    use rift_core::Severity;
+    match level.to_lowercase().as_str() {
+        "low" => Ok(Severity::Low),
+        "medium" | "med" => Ok(Severity::Medium),
+        "high" => Ok(Severity::High),
+        "critical" | "crit" => Ok(Severity::Critical),
+        other => anyhow::bail!("invalid --fail-on level '{other}': expected low, medium, high, or critical"),
+    }
+}
+
+/// Highest-priority meaningful item at or above `threshold`, if any.
+/// Mechanical items never gate (they are collapsed output, not risk); an
+/// empty or all-mechanical review always passes.
+fn gate_trigger(cs: &ChangeSet, threshold: rift_core::Severity) -> Option<&rift_core::ReviewItem> {
+    cs.review_items
+        .iter()
+        .filter(|r| !matches!(r.category, rift_core::Category::Mechanical))
+        .filter(|r| r.severity >= threshold)
+        .max_by(|a, b| {
+            a.severity
+                .cmp(&b.severity)
+                .then(a.priority.cmp(&b.priority))
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rift_core::{Category, ReviewItem, Severity};
+
+    fn item(title: &str, category: Category, severity: Severity) -> ReviewItem {
+        ReviewItem {
+            id: title.into(),
+            title: title.into(),
+            category,
+            severity,
+            priority: 50,
+            confidence: 0.8,
+            files: vec!["a.rs".into()],
+            symbols: vec![],
+            evidence: vec![],
+            why: String::new(),
+        }
+    }
+
+    fn cs_with(items: Vec<ReviewItem>) -> ChangeSet {
+        ChangeSet {
+            repo_root: ".".into(),
+            base_ref: "H".into(),
+            head_ref: "w".into(),
+            files: vec![],
+            symbol_changes: vec![],
+            review_items: items,
+            stats: Default::default(),
+        }
+    }
+
+    #[test]
+    fn parses_levels_case_insensitively() {
+        assert_eq!(parse_severity("low").unwrap(), Severity::Low);
+        assert_eq!(parse_severity("MEDIUM").unwrap(), Severity::Medium);
+        assert_eq!(parse_severity("High").unwrap(), Severity::High);
+        assert_eq!(parse_severity("crit").unwrap(), Severity::Critical);
+        assert!(parse_severity("extreme").is_err());
+    }
+
+    #[test]
+    fn gate_fires_on_highest_qualifying_item() {
+        let cs = cs_with(vec![
+            item("docs", Category::Docs, Severity::Low),
+            item("auth", Category::Auth, Severity::High),
+            item("dep", Category::Dependency, Severity::Critical),
+        ]);
+        assert_eq!(gate_trigger(&cs, Severity::High).unwrap().title, "dep");
+        assert_eq!(gate_trigger(&cs, Severity::Critical).unwrap().title, "dep");
+        assert!(gate_trigger(&cs, Severity::Critical).is_some());
+    }
+
+    #[test]
+    fn gate_ignores_mechanical_and_passes_clean() {
+        let mech = cs_with(vec![item("lock", Category::Mechanical, Severity::Low)]);
+        assert!(gate_trigger(&mech, Severity::Low).is_none());
+        let clean = cs_with(vec![]);
+        assert!(gate_trigger(&clean, Severity::Low).is_none());
+        let low = cs_with(vec![item("docs", Category::Docs, Severity::Low)]);
+        assert!(gate_trigger(&low, Severity::Medium).is_none());
+        assert!(gate_trigger(&low, Severity::Low).is_some());
+    }
 }

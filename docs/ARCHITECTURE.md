@@ -60,7 +60,8 @@
    blast radius, test association, persistent content-hash cache (DONE),
    JEV trait + deterministic adapter (DONE).
 3. Milestone three: task-vs-change verification, optional LLM escalation on
-   compact evidence packages, PR/hook integrations.
+   compact evidence packages, PR/hook integrations (started: `--fail-on`
+   severity gate + pre-commit docs; PR review via `base..head` ranges).
 
 ## Perf baselines (criterion)
 
