@@ -59,6 +59,11 @@ struct Args {
     /// facts only (symbols, evidence summaries, counts) — never source.
     #[arg(long)]
     jev: bool,
+
+    /// Deterministic (offline) Jev judgments: same evidence kinds as --jev,
+    /// computed locally with no API key and no network. For CI and calibration.
+    #[arg(long)]
+    jev_local: bool,
 }
 
 fn main() -> Result<()> {
@@ -86,7 +91,7 @@ fn main() -> Result<()> {
     if args.jev && jev_key.is_none() {
         eprintln!("rift: --jev needs TYPESAFE_API_KEY in the environment; continuing without it");
     }
-    match rift_ui::run_native_progressive(root, base_ref, head_ref, files, jev_key) {
+    match rift_ui::run_native_progressive(root, base_ref, head_ref, files, jev_key, args.jev_local) {
         Ok(_) => Ok(()),
         Err(e) => {
             eprintln!("rift: GUI unavailable ({e}); printing overview instead.\n");
@@ -117,7 +122,18 @@ fn build_changeset(args: &Args) -> Result<ChangeSet> {
             eprintln!("rift: symbol cache save skipped ({e})");
         }
     }
-    if args.jev && (args.json || args.overview || args.no_gui) {
+    if args.jev_local && (args.json || args.overview || args.no_gui) {
+        use rift_jev::Judge as _;
+        match rift_jev::DeterministicJudge.judge(&base_ref, &head_ref, &mut items) {
+            rift_jev::JevStatus::Applied { items: n } => {
+                eprintln!("rift: jev-local judged {n} items (deterministic, offline)");
+            }
+            rift_jev::JevStatus::SkippedNoItems => {}
+            other => {
+                eprintln!("rift: jev-local skipped ({other:?}); review continues without it");
+            }
+        }
+    } else if args.jev && (args.json || args.overview || args.no_gui) {
         match rift_jev::enrich(
             &base_ref,
             &head_ref,

@@ -258,6 +258,8 @@ pub struct AnalysisParams {
     pub head_ref: String,
     pub jev_key: Option<String>,
     pub generation: u64,
+    /// Use the deterministic (offline) judge instead of the cloud API.
+    pub jev_local: bool,
 }
 
 impl AnalysisParams {
@@ -274,7 +276,13 @@ impl AnalysisParams {
             head_ref,
             jev_key,
             generation,
+            jev_local: false,
         }
+    }
+
+    pub fn with_jev_local(mut self) -> Self {
+        self.jev_local = true;
+        self
     }
 }
 
@@ -338,7 +346,20 @@ pub fn run_analysis_job(
     // Blocking (30s timeout), but the window is already painted and spinning.
     // Skipped entirely when cancelled so closing the window never pays for
     // a cloud call it will not display.
-    if let Some(key) = params.jev_key.as_deref() {
+    if params.jev_local {
+        if cancelled() {
+            return false;
+        }
+        use rift_jev::Judge as _;
+        let _ = rift_jev::DeterministicJudge.judge(
+            &params.base_ref,
+            &params.head_ref,
+            &mut items,
+        );
+        if cancelled() {
+            return false;
+        }
+    } else if let Some(key) = params.jev_key.as_deref() {
         if cancelled() {
             return false;
         }
@@ -400,6 +421,7 @@ pub fn run_native_progressive(
     head_ref: String,
     files: Vec<FileChange>,
     jev_key: Option<String>,
+    jev_local: bool,
 ) -> eframe::Result<()> {
     let mut files = files;
     // Generated flags up front so file_symbols can skip cheaply per file.
@@ -408,13 +430,16 @@ pub fn run_native_progressive(
     let files = Arc::new(files);
     let (tx, rx) = mpsc::channel();
     let cancel = new_cancel_token();
-    let params = AnalysisParams::new(
+    let mut params = AnalysisParams::new(
         repo_root.clone(),
         base_ref.clone(),
         head_ref.clone(),
         jev_key.clone(),
         0,
     );
+    if jev_local {
+        params = params.with_jev_local();
+    }
     let title = format!("Rift — {} ({} files)", base_ref, files.len());
 
     // Analysis worker: per-file symbols (progress) then grouping + stats.

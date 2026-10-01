@@ -36,6 +36,9 @@
   review, Noul risk + Score severity per behavior-grade item (max 25),
   answers as `jev-risk`/`jev-severity` evidence. Uncalibrated: nothing
   gates on the numbers yet.
+  `Judge` trait with `CloudJudge` (API key holder) and `DeterministicJudge`
+  (offline baseline, `--jev-local`, no network) — same evidence kinds, so
+  UI/`--overview` render either without branching.
 - **Symbol-bonus cap.** Per-symbol score contributions are capped in
   aggregate so a new 30-symbol file can't outrank an auth behavior change.
 - **Keyword hygiene.** Content signals (`unsafe`, `valid`, …) match on code
@@ -55,7 +58,7 @@
 1. Harden MVP: snapshot tests, cancel-safe background analysis. DONE.
 2. Milestone two: Python/C# depth, move detection, dependency graph +
    blast radius, test association, persistent content-hash cache (DONE),
-   JEV trait + deterministic adapter.
+   JEV trait + deterministic adapter (DONE).
 3. Milestone three: task-vs-change verification, optional LLM escalation on
    compact evidence packages, PR/hook integrations.
 

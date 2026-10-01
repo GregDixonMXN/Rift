@@ -11,6 +11,7 @@ matters, and what deserves human attention — before you merge.
     rift main..HEAD       # branch comparison
     rift --json           # machine-readable ChangeSet (for agents/tools)
     rift --jev --overview # add Jev risk/severity judgments (needs TYPESAFE_API_KEY)
+    rift --jev-local --overview # same evidence kinds, computed offline (no key)
 
 No accounts, no cloud, no config. Local-first and deterministic: parsing and
 static signals come before any probabilistic judgment, and every conclusion

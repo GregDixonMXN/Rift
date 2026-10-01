@@ -139,6 +139,7 @@ pub fn apply_answers(items: &mut [ReviewItem], answers: &Map<String, Value>) {
     }
 }
 
+#[derive(Debug)]
 pub enum JevStatus {
     /// Judgments applied to `n` items.
     Applied { items: usize },
@@ -150,6 +151,143 @@ pub enum JevStatus {
     Failed(String),
 }
 
+/// One judgment source behind `rift --jev`.
+///
+/// The cloud judge calls the TypeSafe API; the deterministic adapter maps
+/// the same structured facts to `jev-risk` / `jev-severity` evidence with
+/// no network. Both write the same evidence kinds so the UI and
+/// `--overview` render either without branching — summaries say which
+/// source produced them.
+pub trait Judge {
+    fn name(&self) -> &'static str;
+    fn judge(
+        &self,
+        base_ref: &str,
+        head_ref: &str,
+        items: &mut [ReviewItem],
+    ) -> JevStatus;
+}
+
+/// Cloud judge: one HTTP call per review (fan-out). Holds the API key so
+/// call sites never handle secrets directly.
+pub struct CloudJudge {
+    key: String,
+}
+
+impl CloudJudge {
+    pub fn new(key: &str) -> Option<Self> {
+        let key = key.trim().to_string();
+        if key.is_empty() {
+            None
+        } else {
+            Some(Self { key })
+        }
+    }
+}
+
+impl Judge for CloudJudge {
+    fn name(&self) -> &'static str {
+        "cloud"
+    }
+
+    fn judge(
+        &self,
+        base_ref: &str,
+        head_ref: &str,
+        items: &mut [ReviewItem],
+    ) -> JevStatus {
+        let targets = judged(items);
+        if targets.is_empty() {
+            return JevStatus::SkippedNoItems;
+        }
+        let body = build_request(base_ref, head_ref, items);
+        let resp = match post(&body, &self.key) {
+            Ok(r) => r,
+            Err(e) => return JevStatus::Failed(format!("{e:#}")),
+        };
+        let answers = resp
+            .get("answers")
+            .and_then(|a| a.as_object())
+            .cloned()
+            .unwrap_or_default();
+        let n = targets.len();
+        apply_answers(items, &answers);
+        JevStatus::Applied { items: n }
+    }
+}
+
+/// Deterministic adapter: pure function of the facts the cloud judge would
+/// receive (category, severity, priority, evidence kinds). No network, no
+/// key, stable across runs — the offline baseline and the CI stand-in.
+///
+/// Risk model (documented, not tuned): starts at 0.15, +0.25 for
+/// auth/security/schema/migration surfaces, +0.20 when no covering tests
+/// are recorded, +0.10 per `validation-removed` / `secret-handling` /
+/// `unsafe` signal (capped at 0.95). Severity mirrors the deterministic
+/// `Severity` (Low→0.0, Medium→1.0, High/Critical→2.0) at fixed 0.90
+/// confidence. Nothing gates on these numbers.
+pub struct DeterministicJudge;
+
+impl Judge for DeterministicJudge {
+    fn name(&self) -> &'static str {
+        "deterministic"
+    }
+
+    fn judge(
+        &self,
+        _base_ref: &str,
+        _head_ref: &str,
+        items: &mut [ReviewItem],
+    ) -> JevStatus {
+        let ids: Vec<String> = judged(items).iter().map(|i| i.id.clone()).collect();
+        if ids.is_empty() {
+            return JevStatus::SkippedNoItems;
+        }
+        for item in items.iter_mut().filter(|i| ids.contains(&i.id)) {
+            let mut risk: f64 = 0.15;
+            if matches!(
+                item.category,
+                Category::Auth
+                    | Category::Security
+                    | Category::Schema
+                    | Category::Migration
+                    | Category::ApiBreak
+            ) {
+                risk += 0.25;
+            }
+            let untested = item.evidence.iter().any(|e| e.kind == "untested-change");
+            if untested {
+                risk += 0.20;
+            }
+            for kind in ["validation-removed", "secret-handling", "unsafe"] {
+                if item.evidence.iter().any(|e| e.kind == kind) {
+                    risk += 0.10;
+                }
+            }
+            let risk = risk.clamp(0.0, 0.95);
+            let file = item.files.first().cloned().unwrap_or_default();
+            item.evidence.push(rift_core::Evidence::new(
+                "jev-risk",
+                &format!("Local P(risky)={risk:.2} (deterministic, no cloud call)"),
+                &file,
+            ));
+            let (score, label) = match item.severity {
+                rift_core::Severity::Low => (0.0, SEVERITY_LEVELS[0]),
+                rift_core::Severity::Medium => (1.0, SEVERITY_LEVELS[1]),
+                rift_core::Severity::High | rift_core::Severity::Critical => {
+                    (2.0, SEVERITY_LEVELS[2])
+                }
+            };
+            item.evidence.push(rift_core::Evidence::new(
+                "jev-severity",
+                &format!("Local severity {score:.1} ({label}, confidence 0.90)"),
+                &file,
+            ));
+        }
+        JevStatus::Applied { items: ids.len() }
+    }
+}
+
 /// Enrich items with Jev judgments. `key=None` (or empty judged set)
 /// skips silently; failures never fail the review.
 pub fn enrich(
@@ -158,26 +296,10 @@ pub fn enrich(
     items: &mut [ReviewItem],
     key: Option<&str>,
 ) -> JevStatus {
-    let Some(key) = key.filter(|k| !k.is_empty()) else {
+    let Some(judge) = key.and_then(CloudJudge::new) else {
         return JevStatus::SkippedNoKey;
     };
-    let targets = judged(items);
-    if targets.is_empty() {
-        return JevStatus::SkippedNoItems;
-    }
-    let body = build_request(base_ref, head_ref, items);
-    let resp = match post(&body, key) {
-        Ok(r) => r,
-        Err(e) => return JevStatus::Failed(format!("{e:#}")),
-    };
-    let answers = resp
-        .get("answers")
-        .and_then(|a| a.as_object())
-        .cloned()
-        .unwrap_or_default();
-    let n = targets.len();
-    apply_answers(items, &answers);
-    JevStatus::Applied { items: n }
+    judge.judge(base_ref, head_ref, items)
 }
 
 fn post(body: &Value, key: &str) -> Result<Value> {
@@ -300,5 +422,65 @@ mod tests {
             enrich("H", "w", &mut items, Some("key")),
             JevStatus::SkippedNoItems
         ));
+    }
+
+    #[test]
+    fn deterministic_judge_needs_no_key() {
+        let judge = DeterministicJudge;
+        assert_eq!(judge.name(), "deterministic");
+        let mut items = vec![
+            item("file:src/auth.rs", Category::Auth),
+            item("file:gen.rs", Category::Mechanical),
+        ];
+        let status = judge.judge("H", "w", &mut items);
+        assert!(matches!(status, JevStatus::Applied { items: 1 }), "{status:?}");
+        let auth = &items[0];
+        assert!(auth.evidence.iter().any(|e| e.kind == "jev-risk"), "{auth:?}");
+        assert!(
+            auth.evidence.iter().any(|e| e.kind == "jev-severity"),
+            "{auth:?}"
+        );
+        assert!(
+            items[1].evidence.iter().all(|e| !e.kind.starts_with("jev-")),
+            "mechanical item must gain no jev evidence: {items:?}"
+        );
+    }
+
+    #[test]
+    fn deterministic_judge_is_stable() {
+        let run = || {
+            let mut items = vec![item("file:src/auth.rs", Category::Auth)];
+            DeterministicJudge.judge("H", "w", &mut items);
+            items
+                .into_iter()
+                .flat_map(|i| {
+                    i.evidence
+                        .into_iter()
+                        .filter(|e| e.kind.starts_with("jev-"))
+                        .map(|e| e.summary)
+                })
+                .collect::<Vec<_>>()
+        };
+        let first = run();
+        assert_eq!(first.len(), 2);
+        assert_eq!(first, run());
+        assert!(first.iter().all(|s| s.contains("Local")));
+    }
+
+    #[test]
+    fn deterministic_judge_dispatches_as_trait_object() {
+        let judge: Box<dyn Judge> = Box::new(DeterministicJudge);
+        let mut items = vec![item("file:src/auth.rs", Category::Behavior)];
+        assert!(matches!(
+            judge.judge("H", "w", &mut items),
+            JevStatus::Applied { items: 1 }
+        ));
+    }
+
+    #[test]
+    fn cloud_judge_rejects_empty_key() {
+        assert!(CloudJudge::new("").is_none());
+        assert!(CloudJudge::new("  ").is_none());
+        assert!(CloudJudge::new("k").is_some());
     }
 }
