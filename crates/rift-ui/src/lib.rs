@@ -4,7 +4,10 @@
 use rift_core::{
     Category, ChangeSet, ChangeStats, DiffLineKind, FileChange, ReviewItem, Severity, SymbolChange,
 };
-use std::sync::mpsc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum View {
@@ -26,20 +29,39 @@ pub struct RiftApp {
     analyzed: Vec<bool>,
     done: bool,
     rx: Option<mpsc::Receiver<UiMsg>>,
+    /// Generation of the analysis this app expects. Stale worker messages
+    /// from a superseded run are ignored (see `drain`).
+    generation: u64,
+    /// Set on Drop so a detached worker stops at the next checkpoint
+    /// instead of finishing wasted work (CPU + optional Jev network call).
+    cancel: Option<Arc<AtomicBool>>,
     /// Flattened raw-diff rows for virtualized rendering.
     diff_rows: Vec<DiffRow>,
 }
 
+/// Cooperative cancellation for the background analysis worker.
+/// Cloneable; `cancel()` signals the worker to stop at the next checkpoint.
+pub fn new_cancel_token() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(false))
+}
+
+pub fn is_cancelled(cancel: &AtomicBool) -> bool {
+    cancel.load(Ordering::Relaxed)
+}
+
 /// Messages from the background analysis worker (see [`RiftApp::pending`]).
+/// Every message carries the run `generation` it belongs to; the app drops
+/// anything that doesn't match `RiftApp::generation`.
 #[derive(Debug)]
 pub enum UiMsg {
     /// One file's symbols are done (index into `cs.files`).
-    Progress { index: usize },
+    Progress { index: usize, generation: u64 },
     /// Grouping + stats finished.
     Finished {
         items: Vec<ReviewItem>,
         stats: ChangeStats,
         syms: Vec<SymbolChange>,
+        generation: u64,
     },
 }
 
@@ -79,18 +101,25 @@ impl RiftApp {
             analyzed: vec![true; n],
             done: true,
             rx: None,
+            generation: 0,
+            cancel: None,
             diff_rows,
         }
     }
 
     /// App with files known but analysis still running. The worker streams
     /// progress; the window paints instantly and fills in as results land.
+    ///
+    /// `generation` tags the expected worker run; `cancel` is signalled on
+    /// Drop so the worker exits at its next checkpoint.
     pub fn pending(
         repo_root: String,
         base_ref: String,
         head_ref: String,
         files: Vec<FileChange>,
         rx: mpsc::Receiver<UiMsg>,
+        generation: u64,
+        cancel: Arc<AtomicBool>,
     ) -> Self {
         let n = files.len();
         let diff_rows = flatten_diff_rows(&files);
@@ -117,11 +146,14 @@ impl RiftApp {
             analyzed: vec![false; n],
             done: false,
             rx: Some(rx),
+            generation,
+            cancel: Some(cancel),
             diff_rows,
         }
     }
 
     /// Drain worker messages (bounded per frame). Returns true if anything landed.
+    /// Messages from a superseded generation are dropped without touching state.
     fn drain(&mut self) -> bool {
         let mut touched = false;
         for _ in 0..64 {
@@ -131,12 +163,23 @@ impl RiftApp {
             };
             touched = true;
             match msg {
-                UiMsg::Progress { index } => {
+                UiMsg::Progress { index, generation } => {
+                    if generation != self.generation {
+                        continue;
+                    }
                     if let Some(slot) = self.analyzed.get_mut(index) {
                         *slot = true;
                     }
                 }
-                UiMsg::Finished { items, stats, syms } => {
+                UiMsg::Finished {
+                    items,
+                    stats,
+                    syms,
+                    generation,
+                } => {
+                    if generation != self.generation {
+                        continue;
+                    }
                     self.cs.review_items = items;
                     self.cs.stats = stats;
                     self.cs.symbol_changes = syms;
@@ -198,6 +241,157 @@ pub fn run_native(cs: ChangeSet) -> eframe::Result<()> {
     )
 }
 
+impl Drop for RiftApp {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel.as_ref() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Owned inputs for one progressive analysis run (bundled so worker
+/// functions stay under the argument limit and call sites read clearly).
+#[derive(Debug, Clone)]
+pub struct AnalysisParams {
+    pub repo_root: String,
+    pub base_ref: String,
+    pub head_ref: String,
+    pub jev_key: Option<String>,
+    pub generation: u64,
+}
+
+impl AnalysisParams {
+    pub fn new(
+        repo_root: String,
+        base_ref: String,
+        head_ref: String,
+        jev_key: Option<String>,
+        generation: u64,
+    ) -> Self {
+        Self {
+            repo_root,
+            base_ref,
+            head_ref,
+            jev_key,
+            generation,
+        }
+    }
+}
+
+/// Cancel-safe analysis job: same stages as the CLI batch path, but checks
+/// `cancel` (and a dead channel) at every checkpoint and stops early.
+/// `cache` is shared across stages and populated as parsing proceeds.
+/// Returns `true` when `Finished` was sent, `false` when cancelled.
+pub fn run_analysis_job(
+    files: &[FileChange],
+    params: &AnalysisParams,
+    tx: &mpsc::Sender<UiMsg>,
+    cancel: &AtomicBool,
+    cache: &mut rift_parser::SymbolCache,
+) -> bool {
+    let cancelled = || cancel.load(Ordering::Relaxed);
+    let send_progress = |index: usize| {
+        if cancelled() {
+            return false;
+        }
+        tx.send(UiMsg::Progress {
+            index,
+            generation: params.generation,
+        })
+        .is_ok()
+    };
+
+    let mut syms_all = Vec::new();
+    for (i, f) in files.iter().enumerate() {
+        if cancelled() {
+            return false;
+        }
+        syms_all.extend(rift_analysis::file_symbols_cached(f, cache));
+        if !send_progress(i) {
+            return false; // UI gone or cancelled.
+        }
+    }
+    if cancelled() {
+        return false;
+    }
+    let syms_all = rift_analysis::link_moves_with_cache(files, syms_all, cache);
+    if cancelled() {
+        return false;
+    }
+    let ctx = rift_analysis::collect_context_with_cache(&params.repo_root, files, cache);
+    if cancelled() {
+        return false;
+    }
+    let mut items = rift_analysis::group_items(files, &syms_all);
+    if cancelled() {
+        return false;
+    }
+    rift_analysis::apply_test_coverage_with_cache(files, &syms_all, &mut items, &ctx, cache);
+    if cancelled() {
+        return false;
+    }
+    rift_analysis::apply_blast_radius_with_cache(files, &mut items, &ctx, cache);
+    if cancelled() {
+        return false;
+    }
+    // Opt-in Jev enrichment, same recipe as the CLI batch path.
+    // Blocking (30s timeout), but the window is already painted and spinning.
+    // Skipped entirely when cancelled so closing the window never pays for
+    // a cloud call it will not display.
+    if let Some(key) = params.jev_key.as_deref() {
+        if cancelled() {
+            return false;
+        }
+        let _ = rift_jev::enrich(&params.base_ref, &params.head_ref, &mut items, Some(key));
+        if cancelled() {
+            return false;
+        }
+    }
+    let stats = rift_analysis::compute_stats(files, &syms_all, &items);
+    if cancelled() {
+        return false;
+    }
+    tx.send(UiMsg::Finished {
+        items,
+        stats,
+        syms: syms_all,
+        generation: params.generation,
+    })
+    .is_ok()
+}
+
+/// Spawn the cancel-safe worker on a background thread.
+/// Takes cache ownership; on completion the cache (populated) is returned
+/// alongside the finished flag so the caller can persist it. `save_to`
+/// also persists inside the worker when the job finishes uncancelled —
+/// detached runs (the GUI) need no join to keep the cache warm.
+pub fn spawn_analysis_worker(
+    files: Arc<Vec<FileChange>>,
+    params: AnalysisParams,
+    tx: mpsc::Sender<UiMsg>,
+    cancel: Arc<AtomicBool>,
+    mut cache: rift_parser::SymbolCache,
+    save_to: Option<std::path::PathBuf>,
+) -> std::thread::JoinHandle<(bool, rift_parser::SymbolCache)> {
+    std::thread::spawn(move || {
+        let finished = run_analysis_job(&files, &params, &tx, &cancel, &mut cache);
+        if finished {
+            if let Some(path) = save_to.as_ref() {
+                let _ = cache.save(path);
+            }
+        }
+        (finished, cache)
+    })
+}
+
+/// Load the persistent symbol cache, or start empty. Never fails.
+pub fn load_persistent_cache() -> (rift_parser::SymbolCache, Option<std::path::PathBuf>) {
+    match rift_parser::default_cache_path() {
+        Some(path) => (rift_parser::SymbolCache::load(&path), Some(path)),
+        None => (rift_parser::SymbolCache::new(), None),
+    }
+}
+
 /// Open the window immediately with the file list; parse + score on a worker
 /// thread and stream results in. First paint never waits for analysis.
 pub fn run_native_progressive(
@@ -207,47 +401,41 @@ pub fn run_native_progressive(
     files: Vec<FileChange>,
     jev_key: Option<String>,
 ) -> eframe::Result<()> {
-    use std::sync::Arc;
     let mut files = files;
     // Generated flags up front so file_symbols can skip cheaply per file.
     // (analyze() re-marks idempotently; flags are plain booleans.)
     rift_analysis::mark_generated(&mut files);
     let files = Arc::new(files);
     let (tx, rx) = mpsc::channel();
+    let cancel = new_cancel_token();
+    let params = AnalysisParams::new(
+        repo_root.clone(),
+        base_ref.clone(),
+        head_ref.clone(),
+        jev_key.clone(),
+        0,
+    );
     let title = format!("Rift — {} ({} files)", base_ref, files.len());
 
     // Analysis worker: per-file symbols (progress) then grouping + stats.
+    // Persistent cache loads here (fast, best-effort) and saves inside the
+    // worker on clean finish — detached runs stay warm with no join.
     {
+        let (cache, save_to) = load_persistent_cache();
         let wfiles = Arc::clone(&files);
-        let wroot = repo_root.clone();
-        let wbase = base_ref.clone();
-        let whead = head_ref.clone();
+        let wparams = params.clone();
+        let wtx = tx;
+        let wcancel = Arc::clone(&cancel);
         std::thread::spawn(move || {
-            let mut syms_all = Vec::new();
-            for (i, f) in wfiles.iter().enumerate() {
-                syms_all.extend(rift_analysis::file_symbols(f));
-                if tx.send(UiMsg::Progress { index: i }).is_err() {
-                    return; // UI closed.
-                }
+            let mut cache = cache;
+            run_analysis_job(&wfiles, &wparams, &wtx, &wcancel, &mut cache);
+            if let Some(path) = save_to.as_ref() {
+                let _ = cache.save(path);
             }
-            let syms_all = rift_analysis::link_moves(&wfiles, syms_all);
-            let ctx = rift_analysis::collect_context(&wroot, &wfiles);
-            let mut items = rift_analysis::group_items(&wfiles, &syms_all);
-            rift_analysis::apply_test_coverage(&wfiles, &syms_all, &mut items, &ctx);
-            rift_analysis::apply_blast_radius(&wfiles, &mut items, &ctx);
-            // Opt-in Jev enrichment, same recipe as the CLI batch path.
-            // Blocking, but the window is already painted and spinning.
-            if let Some(key) = jev_key.as_deref() {
-                let _ = rift_jev::enrich(&wbase, &whead, &mut items, Some(key));
-            }
-            let stats = rift_analysis::compute_stats(&wfiles, &syms_all, &items);
-            let _ = tx.send(UiMsg::Finished {
-                items,
-                stats,
-                syms: syms_all,
-            });
         });
     }
+
+    let generation = params.generation;
 
     let app_files: Vec<FileChange> = (*files).clone();
     let options = eframe::NativeOptions {
@@ -259,10 +447,10 @@ pub fn run_native_progressive(
     eframe::run_native(
         "rift",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
             Ok(Box::new(RiftApp::pending(
-                repo_root, base_ref, head_ref, app_files, rx,
+                repo_root, base_ref, head_ref, app_files, rx, generation, cancel,
             )))
         }),
     )
@@ -865,11 +1053,23 @@ mod tests {
         use rift_core::ChangeStats;
         let (tx, rx) = mpsc::channel();
         let files = vec![file_with_hunks("a.rs", 1, 1)];
-        let mut app = RiftApp::pending(".".into(), "HEAD".into(), "worktree".into(), files, rx);
+        let mut app = RiftApp::pending(
+            ".".into(),
+            "HEAD".into(),
+            "worktree".into(),
+            files,
+            rx,
+            0,
+            new_cancel_token(),
+        );
         assert!(!app.done);
         assert_eq!(app.analyzed_count(), 0);
 
-        tx.send(UiMsg::Progress { index: 0 }).unwrap();
+        tx.send(UiMsg::Progress {
+            index: 0,
+            generation: 0,
+        })
+        .unwrap();
         assert!(app.drain());
         assert_eq!(app.analyzed_count(), 1);
         assert!(!app.done);
@@ -881,11 +1081,154 @@ mod tests {
                 ..Default::default()
             },
             syms: vec![],
+            generation: 0,
         })
         .unwrap();
         assert!(app.drain());
         assert!(app.done);
         assert_eq!(app.visible_items(), vec![0]);
         assert_eq!(app.analyzed_count(), 1);
+    }
+
+    #[test]
+    fn stale_generation_is_ignored() {
+        use rift_core::ChangeStats;
+        let (tx, rx) = mpsc::channel();
+        let files = vec![file_with_hunks("a.rs", 1, 1)];
+        let mut app = RiftApp::pending(
+            ".".into(),
+            "HEAD".into(),
+            "worktree".into(),
+            files,
+            rx,
+            1,
+            new_cancel_token(),
+        );
+        // Old run's messages must not touch new-run state.
+        tx.send(UiMsg::Progress {
+            index: 0,
+            generation: 0,
+        })
+        .unwrap();
+        assert!(app.drain());
+        assert_eq!(app.analyzed_count(), 0);
+        assert!(!app.done);
+
+        tx.send(UiMsg::Finished {
+            items: vec![item("a", "auth timeout", Category::Auth)],
+            stats: ChangeStats {
+                files_changed: 1,
+                ..Default::default()
+            },
+            syms: vec![],
+            generation: 0,
+        })
+        .unwrap();
+        assert!(app.drain());
+        assert!(!app.done);
+        assert!(app.visible_items().is_empty());
+    }
+
+    #[test]
+    fn cancelled_job_sends_nothing() {
+        let (tx, rx) = mpsc::channel();
+        let cancel = new_cancel_token();
+        cancel.store(true, Ordering::Relaxed);
+        let files = vec![file_with_hunks("a.rs", 1, 1)];
+        let params = AnalysisParams::new(".".into(), "HEAD".into(), "work".into(), None, 0);
+        let mut cache = rift_parser::SymbolCache::new();
+        let finished = run_analysis_job(&files, &params, &tx, &cancel, &mut cache);
+        assert!(!finished);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn job_completes_when_not_cancelled() {
+        let (tx, rx) = mpsc::channel();
+        let cancel = new_cancel_token();
+        let files = vec![file_with_hunks("a.rs", 1, 1)];
+        let params = AnalysisParams::new(".".into(), "HEAD".into(), "work".into(), None, 7);
+        let mut cache = rift_parser::SymbolCache::new();
+        let finished = run_analysis_job(&files, &params, &tx, &cancel, &mut cache);
+        assert!(finished);
+        let mut saw_progress = false;
+        let mut saw_finished = false;
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                UiMsg::Progress { generation, .. } => {
+                    assert_eq!(generation, 7);
+                    saw_progress = true;
+                }
+                UiMsg::Finished { generation, .. } => {
+                    assert_eq!(generation, 7);
+                    saw_finished = true;
+                }
+            }
+        }
+        assert!(saw_progress);
+        assert!(saw_finished);
+    }
+
+    #[test]
+    fn spawned_worker_is_joinable_and_cancel_safe() {
+        let files = Arc::new(vec![file_with_hunks("a.rs", 2, 1)]);
+        let (tx, rx) = mpsc::channel();
+        let cancel = new_cancel_token();
+        let params = AnalysisParams::new(".".into(), "HEAD".into(), "work".into(), None, 3);
+        let handle = spawn_analysis_worker(
+            Arc::clone(&files),
+            params,
+            tx,
+            Arc::clone(&cancel),
+            rift_parser::SymbolCache::new(),
+            None,
+        );
+        let (finished, _cache) = handle.join().expect("worker join");
+        assert!(finished);
+        // Drain: only generation 3 lands, app at generation 3 finishes.
+        let mut app = RiftApp::pending(
+            ".".into(),
+            "HEAD".into(),
+            "work".into(),
+            (*files).clone(),
+            rx,
+            3,
+            cancel,
+        );
+        assert!(app.drain());
+        assert!(app.done);
+    }
+
+    #[test]
+    fn second_run_hits_cache() {
+        let (tx, _rx) = mpsc::channel();
+        let cancel = new_cancel_token();
+        let files = vec![file_with_hunks("a.rs", 1, 1)];
+        let params = AnalysisParams::new(".".into(), "HEAD".into(), "work".into(), None, 0);
+        let mut cache = rift_parser::SymbolCache::new();
+        assert!(run_analysis_job(&files, &params, &tx, &cancel, &mut cache));
+        assert!(cache.misses > 0);
+        let hits_before = cache.hits;
+        assert!(run_analysis_job(&files, &params, &tx, &cancel, &mut cache));
+        assert!(cache.hits > hits_before);
+    }
+
+    #[test]
+    fn drop_signals_cancel() {        let (tx, rx) = mpsc::channel();
+        let cancel = new_cancel_token();
+        {
+            let _app = RiftApp::pending(
+                ".".into(),
+                "HEAD".into(),
+                "work".into(),
+                vec![file_with_hunks("a.rs", 1, 1)],
+                rx,
+                0,
+                Arc::clone(&cancel),
+            );
+            assert!(!is_cancelled(&cancel));
+            let _ = tx;
+        }
+        assert!(is_cancelled(&cancel));
     }
 }

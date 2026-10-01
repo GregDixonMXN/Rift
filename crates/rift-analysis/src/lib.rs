@@ -5,7 +5,9 @@ use rift_core::{
     Category, ChangeSet, Evidence, FileChange, FileStatus, Language, ReviewItem, Severity,
     SymbolChange, SymbolChangeKind, SymbolKind,
 };
-use rift_parser::{called_names, diff_symbols, extract_symbols, imported_names, test_targets};
+use rift_parser::{
+    called_names, diff_symbols, extract_cached, imported_names, test_targets, SymbolCache,
+};
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
@@ -41,9 +43,39 @@ pub fn analyze(
     (sym_changes, items)
 }
 
+/// Cached pipeline: same conclusions as [`analyze`], but identical
+/// `(language, content)` inputs parse once per cache lifetime. Sequential
+/// (not rayon): the UI worker streams per-file progress anyway, and cache
+/// hits dominate on repeat runs. `cache` is both read and populated —
+/// callers persist it with `SymbolCache::save`.
+pub fn analyze_with_cache(
+    repo_root: &str,
+    _base_ref: &str,
+    _head_ref: &str,
+    files: &mut [FileChange],
+    cache: &mut SymbolCache,
+) -> (Vec<SymbolChange>, Vec<ReviewItem>) {
+    mark_generated(files);
+    let mut sym_changes = Vec::new();
+    for f in files.iter() {
+        sym_changes.extend(file_symbols_cached(f, cache));
+    }
+    let sym_changes = link_moves_with_cache(files, sym_changes, cache);
+    let ctx = collect_context_with_cache(repo_root, files, cache);
+    let mut items = group_items(files, &sym_changes);
+    apply_test_coverage_with_cache(files, &sym_changes, &mut items, &ctx, cache);
+    apply_blast_radius_with_cache(files, &mut items, &ctx, cache);
+    (sym_changes, items)
+}
+
 /// Symbol-level changes for one file. Pure function — safe to run on any
 /// thread, and reused by the UI's progressive worker one file at a time.
 pub fn file_symbols(f: &FileChange) -> Vec<SymbolChange> {
+    file_symbols_cached(f, &mut SymbolCache::new())
+}
+
+/// Cached variant: shares parses across old/new sides and repeat calls.
+pub fn file_symbols_cached(f: &FileChange, cache: &mut SymbolCache) -> Vec<SymbolChange> {
     if f.is_binary || f.is_generated {
         return Vec::new();
     }
@@ -59,12 +91,12 @@ pub fn file_symbols(f: &FileChange) -> Vec<SymbolChange> {
     let old_syms = f
         .old_content
         .as_deref()
-        .map(|c| extract_symbols(&f.old_path, f.language, c))
+        .map(|c| extract_cached(&f.old_path, f.language, c, cache))
         .unwrap_or_default();
     let new_syms = f
         .new_content
         .as_deref()
-        .map(|c| extract_symbols(path, f.language, c))
+        .map(|c| extract_cached(path, f.language, c, cache))
         .unwrap_or_default();
     // For added/deleted whole files, synthesize from one side.
     let mut d = diff_symbols(
@@ -156,6 +188,15 @@ fn kind_key(kind: SymbolKind) -> String {
 /// `--json` is stable across runs. Runs after per-file collection, before
 /// grouping; the UI worker applies the same step.
 pub fn link_moves(files: &[FileChange], syms: Vec<SymbolChange>) -> Vec<SymbolChange> {
+    link_moves_with_cache(files, syms, &mut SymbolCache::new())
+}
+
+/// Cached variant: the intra-file reorder re-parse hits the shared cache.
+pub fn link_moves_with_cache(
+    files: &[FileChange],
+    syms: Vec<SymbolChange>,
+    cache: &mut SymbolCache,
+) -> Vec<SymbolChange> {
     let by_path: HashMap<&str, &FileChange> = files.iter().map(|f| (f.display_path(), f)).collect();
 
     struct Cand {
@@ -377,8 +418,8 @@ pub fn link_moves(files: &[FileChange], syms: Vec<SymbolChange>) -> Vec<SymbolCh
         else {
             continue;
         };
-        let old_syms = extract_symbols(path, f.language, old_c);
-        let new_syms = extract_symbols(path, f.language, new_c);
+        let old_syms = extract_cached(path, f.language, old_c, cache);
+        let new_syms = extract_cached(path, f.language, new_c, cache);
         let old_keys: Vec<String> = old_syms
             .iter()
             .map(|s| format!("{:?}::{}", s.kind, s.name))
@@ -514,6 +555,15 @@ pub struct RepoContext {
 /// Deterministic (sorted traversal); skips files already in the diff.
 /// Resolves against the worktree even when reviewing old commits.
 pub fn collect_context(root: &str, files: &[FileChange]) -> RepoContext {
+    collect_context_with_cache(root, files, &mut SymbolCache::new())
+}
+
+/// Cached variant: worktree scans hit the shared cache across runs.
+pub fn collect_context_with_cache(
+    root: &str,
+    files: &[FileChange],
+    cache: &mut SymbolCache,
+) -> RepoContext {
     const MAX_SCAN_FILES: usize = 200;
     const MAX_SCAN_SOURCES: usize = 400;
     const MAX_SCAN_BYTES: u64 = 256 * 1024;
@@ -580,7 +630,7 @@ pub fn collect_context(root: &str, files: &[FileChange]) -> RepoContext {
             if is_test {
                 scanned_tests += 1;
                 let lines: Vec<&str> = content.lines().collect();
-                for s in extract_symbols(&rel, lang, &content) {
+                for s in extract_cached(&rel, lang, &content, cache) {
                     if !s.is_test {
                         continue;
                     }
@@ -594,7 +644,7 @@ pub fn collect_context(root: &str, files: &[FileChange]) -> RepoContext {
                 }
             } else {
                 scanned_sources += 1;
-                let table = extract_symbols(&rel, lang, &content);
+                let table = extract_cached(&rel, lang, &content, cache);
                 ctx.sources.push(SourceRef {
                     path: rel.clone(),
                     symbols: table.iter().map(|s| s.name.clone()).collect(),
@@ -620,6 +670,17 @@ pub fn apply_test_coverage(
     items: &mut [ReviewItem],
     ctx: &RepoContext,
 ) {
+    apply_test_coverage_with_cache(files, syms, items, ctx, &mut SymbolCache::new())
+}
+
+/// Cached variant: changed-file test scans hit the shared cache.
+pub fn apply_test_coverage_with_cache(
+    files: &[FileChange],
+    syms: &[SymbolChange],
+    items: &mut [ReviewItem],
+    ctx: &RepoContext,
+    cache: &mut SymbolCache,
+) {
     let mut tests: Vec<TestInfo> = Vec::new();
     for f in files {
         // Generated files contribute no test signal; parsing them here
@@ -632,7 +693,7 @@ pub fn apply_test_coverage(
             continue;
         };
         let lines: Vec<&str> = content.lines().collect();
-        for s in extract_symbols(path, f.language, content) {
+        for s in extract_cached(path, f.language, content, cache) {
             if !(s.is_test || f.is_test_file) {
                 continue;
             }
@@ -731,6 +792,16 @@ pub fn apply_test_coverage(
 /// are excluded — they are reported by coverage instead. Runs after
 /// grouping; the UI worker applies the same step.
 pub fn apply_blast_radius(files: &[FileChange], items: &mut [ReviewItem], ctx: &RepoContext) {
+    apply_blast_radius_with_cache(files, items, ctx, &mut SymbolCache::new())
+}
+
+/// Cached variant: changed-file definers hit the shared cache.
+pub fn apply_blast_radius_with_cache(
+    files: &[FileChange],
+    items: &mut [ReviewItem],
+    ctx: &RepoContext,
+    cache: &mut SymbolCache,
+) {
     // name -> defining files (worktree sources + changed files' new tree).
     // Generated files are not definers: bundles duplicate src and would
     // only dilute uniqueness (and repay the slowest parses).
@@ -748,7 +819,7 @@ pub fn apply_blast_radius(files: &[FileChange], items: &mut [ReviewItem], ctx: &
         let Some(content) = f.new_content.as_deref() else {
             continue;
         };
-        for s in extract_symbols(path, f.language, content) {
+        for s in extract_cached(path, f.language, content, cache) {
             defn.entry(s.name.clone())
                 .or_default()
                 .push(path.to_string());
@@ -2021,5 +2092,27 @@ mod tests {
                 .all(|s| !matches!(s.change, SymbolChangeKind::Moved)),
             "{linked:?}"
         );
+    }
+
+    #[test]
+    fn cached_pipeline_matches_uncached() {
+        // Same fixture through both pipelines: conclusions must agree.
+        let old = "pub fn login(x: &str) -> bool {\n    x.len() > 3\n}\n";
+        let new = "pub fn login(x: &str) -> bool {\n    check(x)\n}\n";
+        let mut a = vec![moved_fc("src/auth.rs", Some(old), Some(new))];
+        let mut b = vec![moved_fc("src/auth.rs", Some(old), Some(new))];
+        let (syms_a, items_a) = analyze("", "H", "w", &mut a);
+        let mut cache = rift_parser::SymbolCache::new();
+        let (syms_b, items_b) = analyze_with_cache("", "H", "w", &mut b, &mut cache);
+        assert!(cache.hits > 0, "expected at least one cache hit");
+        let key = |s: &SymbolChange| (s.file.clone(), s.name.clone(), format!("{:?}", s.change));
+        let mut ka: Vec<_> = syms_a.iter().map(key).collect();
+        let mut kb: Vec<_> = syms_b.iter().map(key).collect();
+        ka.sort();
+        kb.sort();
+        assert_eq!(ka, kb, "symbol conclusions diverged");
+        let ia: Vec<_> = items_a.iter().map(|i| (i.id.clone(), i.priority)).collect();
+        let ib: Vec<_> = items_b.iter().map(|i| (i.id.clone(), i.priority)).collect();
+        assert_eq!(ia, ib, "review items diverged");
     }
 }

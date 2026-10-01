@@ -8,6 +8,7 @@ license = "Apache-2.0"
 rift-core = { path = "../rift-core" }
 rift-analysis = { path = "../rift-analysis" }
 rift-jev = { path = "../rift-jev" }
+rift-parser = { path = "../rift-parser" }
 anyhow = { workspace = true }
 eframe = { version = "0.28", default-features = false, features = ["default_fonts", "glow"] }
 egui = "0.28"

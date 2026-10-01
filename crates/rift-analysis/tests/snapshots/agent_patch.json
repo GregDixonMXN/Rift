@@ -1,0 +1,231 @@
+{
+  "repo_root": "<ROOT>",
+  "base_ref": "HEAD~1",
+  "head_ref": "HEAD",
+  "files": [
+    {
+      "old_path": "src/auth.rs",
+      "new_path": "src/auth.rs",
+      "status": "Modified",
+      "language": "Rust",
+      "is_binary": false,
+      "is_generated": false,
+      "is_test_file": false,
+      "added_lines": 1,
+      "deleted_lines": 4,
+      "hunks": [
+        {
+          "old_start": 1,
+          "old_lines": 8,
+          "new_start": 1,
+          "new_lines": 5,
+          "header": "@@ -1,8 +1,5 @@\n",
+          "lines": [
+            {
+              "kind": "Deletion",
+              "text": "pub const SESSION_TIMEOUT: u64 = 900;"
+            },
+            {
+              "kind": "Addition",
+              "text": "pub const SESSION_TIMEOUT: u64 = 86400;"
+            },
+            {
+              "kind": "Context",
+              "text": ""
+            },
+            {
+              "kind": "Context",
+              "text": "pub fn validate_token(token: &str) -> bool {"
+            },
+            {
+              "kind": "Deletion",
+              "text": "    if token.len() <= 10 {"
+            },
+            {
+              "kind": "Deletion",
+              "text": "        return false;"
+            },
+            {
+              "kind": "Deletion",
+              "text": "    }"
+            },
+            {
+              "kind": "Context",
+              "text": "    true"
+            },
+            {
+              "kind": "Context",
+              "text": "}"
+            }
+          ]
+        }
+      ],
+      "old_content": "pub const SESSION_TIMEOUT: u64 = 900;\n\npub fn validate_token(token: &str) -> bool {\n    if token.len() <= 10 {\n        return false;\n    }\n    true\n}\n",
+      "new_content": "pub const SESSION_TIMEOUT: u64 = 86400;\n\npub fn validate_token(token: &str) -> bool {\n    true\n}\n"
+    },
+    {
+      "old_path": "src/lib.rs",
+      "new_path": "src/lib.rs",
+      "status": "Modified",
+      "language": "Rust",
+      "is_binary": false,
+      "is_generated": false,
+      "is_test_file": false,
+      "added_lines": 1,
+      "deleted_lines": 1,
+      "hunks": [
+        {
+          "old_start": 1,
+          "old_lines": 3,
+          "new_start": 1,
+          "new_lines": 3,
+          "header": "@@ -1,3 +1,3 @@\n",
+          "lines": [
+            {
+              "kind": "Deletion",
+              "text": "pub fn fetch_user(id: u64) -> String {"
+            },
+            {
+              "kind": "Addition",
+              "text": "pub fn fetch_user_by_id(id: u64) -> String {"
+            },
+            {
+              "kind": "Context",
+              "text": "    format!(\"user-{id}\")"
+            },
+            {
+              "kind": "Context",
+              "text": "}"
+            }
+          ]
+        }
+      ],
+      "old_content": "pub fn fetch_user(id: u64) -> String {\n    format!(\"user-{id}\")\n}\n",
+      "new_content": "pub fn fetch_user_by_id(id: u64) -> String {\n    format!(\"user-{id}\")\n}\n"
+    }
+  ],
+  "symbol_changes": [
+    {
+      "file": "src/auth.rs",
+      "name": "SESSION_TIMEOUT",
+      "kind": "Const",
+      "change": "Modified",
+      "confidence": 0.9,
+      "old_signature": "const SESSION_TIMEOUT",
+      "new_signature": "const SESSION_TIMEOUT",
+      "old_lines": [
+        1,
+        1
+      ],
+      "new_lines": [
+        1,
+        1
+      ],
+      "evidence": [
+        "body lines differ"
+      ]
+    },
+    {
+      "file": "src/auth.rs",
+      "name": "validate_token",
+      "kind": "Function",
+      "change": "Modified",
+      "confidence": 0.9,
+      "old_signature": "fn validate_token(token : & str) -> bool",
+      "new_signature": "fn validate_token(token : & str) -> bool",
+      "old_lines": [
+        3,
+        8
+      ],
+      "new_lines": [
+        3,
+        5
+      ],
+      "evidence": [
+        "body lines differ"
+      ]
+    },
+    {
+      "file": "src/lib.rs",
+      "name": "fetch_user → fetch_user_by_id",
+      "kind": "Function",
+      "change": "Renamed",
+      "confidence": 0.7,
+      "old_signature": "fn fetch_user(id : u64) -> String",
+      "new_signature": "fn fetch_user_by_id(id : u64) -> String",
+      "old_lines": [
+        1,
+        3
+      ],
+      "new_lines": [
+        1,
+        3
+      ],
+      "evidence": [
+        "same-kind symbol with similar name (fetch_user vs fetch_user_by_id)"
+      ]
+    }
+  ],
+  "review_items": [
+    {
+      "id": "file:src/auth.rs",
+      "title": "src/auth.rs — 2 symbols changed",
+      "category": "Auth",
+      "severity": "Critical",
+      "priority": 89,
+      "confidence": 0.8,
+      "files": [
+        "src/auth.rs"
+      ],
+      "symbols": [
+        "SESSION_TIMEOUT",
+        "validate_token"
+      ],
+      "evidence": [
+        {
+          "kind": "auth-surface",
+          "summary": "change touches authentication/authorization surface",
+          "file": "src/auth.rs",
+          "old_value": null,
+          "new_value": null
+        }
+      ],
+      "why": "Const SESSION_TIMEOUT (Modified); Function validate_token (Modified)"
+    },
+    {
+      "id": "file:src/lib.rs",
+      "title": "src/lib.rs — fetch_user → fetch_user_by_id renamed",
+      "category": "Refactor",
+      "severity": "Low",
+      "priority": 25,
+      "confidence": 0.8,
+      "files": [
+        "src/lib.rs"
+      ],
+      "symbols": [
+        "fetch_user → fetch_user_by_id"
+      ],
+      "evidence": [
+        {
+          "kind": "rename-move",
+          "summary": "renamed/moved: fetch_user → fetch_user_by_id",
+          "file": "src/lib.rs",
+          "old_value": null,
+          "new_value": null
+        }
+      ],
+      "why": "Function fetch_user → fetch_user_by_id (Renamed)"
+    }
+  ],
+  "stats": {
+    "files_changed": 2,
+    "added_lines": 2,
+    "deleted_lines": 5,
+    "meaningful_changes": 2,
+    "mechanical_files": 0,
+    "test_files": 0,
+    "symbols_added": 0,
+    "symbols_removed": 0,
+    "symbols_modified": 3
+  }
+}

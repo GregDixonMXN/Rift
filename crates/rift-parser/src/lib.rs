@@ -2,6 +2,9 @@
 //! Python, Go, and C#, line-regex fallback for other languages.
 //! Then symbol-level diffing.
 
+pub mod cache;
+pub use cache::{content_key, default_cache_path, SymbolCache};
+
 use rift_core::{Language, Symbol, SymbolChange, SymbolChangeKind, SymbolKind};
 use std::collections::HashMap;
 use syn::spanned::Spanned;
@@ -17,6 +20,18 @@ pub fn extract_symbols(path: &str, language: Language, content: &str) -> Vec<Sym
         Language::Python | Language::Go | Language::CSharp => extract_lang(path, language, content),
         _ => extract_generic(path, content),
     }
+}
+
+/// Cached extraction through [`SymbolCache`]: identical contents parse once.
+pub fn extract_cached(
+    path: &str,
+    language: Language,
+    content: &str,
+    cache: &mut SymbolCache,
+) -> Vec<Symbol> {
+    cache.extract(path, language, content, || {
+        extract_symbols(path, language, content)
+    })
 }
 
 fn extract_rust(path: &str, content: &str) -> Vec<Symbol> {

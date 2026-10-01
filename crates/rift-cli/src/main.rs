@@ -103,7 +103,20 @@ fn build_changeset(args: &Args) -> Result<ChangeSet> {
 
     let (mut files, base_ref, head_ref) = resolve_files(&engine, args)?;
 
-    let (syms, mut items) = rift_analysis::analyze(&root, &base_ref, &head_ref, &mut files);
+    // Persistent symbol cache: warm runs skip re-parsing unchanged contents.
+    // Best-effort — a missing or unwritable cache never fails the review.
+    let cache_path = rift_parser::default_cache_path();
+    let mut cache = cache_path
+        .as_ref()
+        .map(|p| rift_parser::SymbolCache::load(p))
+        .unwrap_or_default();
+    let (syms, mut items) =
+        rift_analysis::analyze_with_cache(&root, &base_ref, &head_ref, &mut files, &mut cache);
+    if let Some(path) = cache_path.as_ref() {
+        if let Err(e) = cache.save(path) {
+            eprintln!("rift: symbol cache save skipped ({e})");
+        }
+    }
     if args.jev && (args.json || args.overview || args.no_gui) {
         match rift_jev::enrich(
             &base_ref,

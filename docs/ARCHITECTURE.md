@@ -41,18 +41,38 @@
 - **Keyword hygiene.** Content signals (`unsafe`, `valid`, …) match on code
   with string literals, raw strings, and line comments stripped, so tooling
   that *mentions* a keyword isn't flagged as *using* it.
+- **Content-hash symbol cache.** Parsing is pure, so `rift-parser` keys
+  symbols on `sha256(language + content)` (`SymbolCache`, `MAX_ENTRIES`
+  5000, deterministic eviction). `analyze_with_cache` threads one cache
+  through symbols, moves, context, coverage, and blast radius; the CLI and
+  the GUI worker persist to `$XDG_CACHE_HOME/rift/symbols-v1.json`
+  (atomic write, corrupt files ignored). Uncached `analyze` stays parallel
+  for cold runs. Measured on this repo (12 files): 0.057s cold → 0.017s
+  warm (~3.3×).
 
 ## What's next (in order)
 
-1. Harden MVP: snapshot tests, cancel-safe background analysis.
+1. Harden MVP: snapshot tests, cancel-safe background analysis. DONE.
 2. Milestone two: Python/C# depth, move detection, dependency graph +
-   blast radius, test association, persistent content-hash cache, JEV trait
-   + deterministic adapter.
+   blast radius, test association, persistent content-hash cache (DONE),
+   JEV trait + deterministic adapter.
 3. Milestone three: task-vs-change verification, optional LLM escalation on
    compact evidence packages, PR/hook integrations.
 
-## Perf baselines (criterion, Windows x64, debug)
+## Perf baselines (criterion)
+
+Windows x64, debug:
 
 - `analyze_200_files`: ~1.85 ms — 200-file review grouping is trivial.
 - `extract_400_fns`: ~8.6 ms — syn extraction on a 400-function module.
-- Run: `cargo bench -p rift-parser -p rift-analysis`.
+
+Linux x86_64 (Omarchy, 16-core, release, 2026-10-01):
+
+- `analyze_200_files`: ~8.49 ms
+- `analyze_2000_files`: ~26.67 ms
+- `extract_400_fns`: ~3.81 ms
+- `diff_400_fns`: ~0.23 ms
+- `symbols_many_fn_py_512k`: ~107.98 ms
+- `symbols_minified_js_512k`: ~0.03 ms
+
+Run: `cargo bench -p rift-parser -p rift-analysis`.
