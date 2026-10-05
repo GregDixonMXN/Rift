@@ -936,6 +936,104 @@ pub fn render_text_overview(cs: &ChangeSet) -> String {
     s
 }
 
+/// GitHub Actions workflow commands, one per meaningful review item.
+/// Critical/High become `::error`, Medium `::warning`, Low `::notice`;
+/// mechanical items are collapsed output, never annotations. Data is
+/// escaped per the runner's rules (`%`, CR, LF).
+pub fn render_github_annotations(cs: &ChangeSet) -> String {
+    let mut s = String::new();
+    for r in cs.sorted_review_items() {
+        if matches!(r.category, Category::Mechanical) {
+            continue;
+        }
+        let cmd = match r.severity {
+            Severity::Critical | Severity::High => "error",
+            Severity::Medium => "warning",
+            Severity::Low => "notice",
+        };
+        let mut props = format!("title={:?} {}", r.severity, single_line(&r.title));
+        if let Some(f) = r.files.first() {
+            props = format!("file={},{}", f, props);
+        }
+        let mut msg = single_line(&r.why);
+        let ev: Vec<String> = r.evidence.iter().map(|e| e.summary.clone()).collect();
+        if !ev.is_empty() {
+            msg = format!("{} | evidence: {}", msg, ev.join("; "));
+        }
+        s.push_str(&format!("::{} {}::{}\n", cmd, props, escape_github(&msg)));
+    }
+    s
+}
+
+/// JUnit XML for CI dashboards: one testcase per review item. Items at or
+/// above `fail_threshold` become `<failure>`s, mechanical items become
+/// `<skipped/>`, everything else passes quietly. Counts always match the
+/// emitted elements.
+pub fn render_junit(cs: &ChangeSet, fail_threshold: Severity) -> String {
+    let mut s = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    let mut cases = String::new();
+    let mut failures = 0;
+    let mut skipped = 0;
+    let mut items: Vec<&ReviewItem> = cs.review_items.iter().collect();
+    items.sort_by(|a, b| a.id.cmp(&b.id));
+    for r in &items {
+        cases.push_str(&format!(
+            "  <testcase classname=\"{:?}\" name=\"{}\">",
+            r.category,
+            escape_xml(&r.title)
+        ));
+        if matches!(r.category, Category::Mechanical) {
+            cases.push_str("<skipped/></testcase>\n");
+            skipped += 1;
+        } else if r.severity >= fail_threshold {
+            failures += 1;
+            cases.push_str(&format!(
+                "<failure message=\"[{:?}] {}\">{}</failure></testcase>\n",
+                r.severity,
+                escape_xml(&single_line(&r.title)),
+                escape_xml(&single_line(&r.why))
+            ));
+        } else {
+            cases.push_str("</testcase>\n");
+        }
+    }
+    s.push_str(&format!(
+        "<testsuite name=\"rift\" tests=\"{}\" failures=\"{failures}\" skipped=\"{skipped}\">\n{}</testsuite>\n",
+        items.len(),
+        cases
+    ));
+    s
+}
+
+/// Collapse to one line and escape `%`, CR, LF for workflow commands.
+fn escape_github(s: &str) -> String {
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace('%', "%25")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A")
+}
+
+fn escape_xml(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn single_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1035,6 +1133,43 @@ mod tests {
         assert!(!out.contains("covered by x"), "{out}");
     }
 
+    #[test]
+    fn github_annotations_map_severity_and_escape() {
+        let mut evil = item("e", "100% \"quoted\" title", Category::Auth);
+        evil.severity = Severity::Critical;
+        evil.why = "line one\nline two 100%".into();
+        let mut med = item("m", "medium thing", Category::Behavior);
+        med.severity = Severity::Medium;
+        let cs = cs_with(vec![
+            evil,
+            med,
+            item("mech", "lockfile", Category::Mechanical),
+        ]);
+        let out = render_github_annotations(&cs);
+        assert!(out.contains("::error file=a.rs,title=Critical"), "{out}");
+        assert!(out.contains("100%25"), "{out}");
+        assert_eq!(out.lines().count(), 2, "messages stay single-line: {out}");
+        assert!(out.contains("::warning "), "{out}");
+        assert!(!out.contains("lockfile"), "{out}");
+    }
+
+    #[test]
+    fn junit_counts_failures_and_skips() {
+        let mut high = item("h", "auth <timeout> & \"friends\"", Category::Auth);
+        high.severity = Severity::High;
+        let cs = cs_with(vec![
+            high,
+            item("l", "docs tweak", Category::Docs),
+            item("m", "lockfile", Category::Mechanical),
+        ]);
+        let out = render_junit(&cs, Severity::High);
+        assert!(out.contains("tests=\"3\" failures=\"1\" skipped=\"1\""), "{out}");
+        assert!(out.contains("&lt;timeout&gt; &amp; &quot;friends&quot;"), "{out}");
+        assert!(out.contains("<skipped/>"), "{out}");
+        // Lower threshold fails more.
+        let out2 = render_junit(&cs, Severity::Low);
+        assert!(out2.contains("failures=\"2\""), "{out2}");
+    }
 
     #[test]
     fn text_overview_appends_task_check() {

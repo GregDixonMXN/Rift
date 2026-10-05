@@ -59,9 +59,17 @@
 2. Milestone two: Python/C# depth, move detection, dependency graph +
    blast radius, test association, persistent content-hash cache (DONE),
    JEV trait + deterministic adapter (DONE).
-3. Milestone three: task-vs-change verification, optional LLM escalation on
-   compact evidence packages, PR/hook integrations (started: `--fail-on`
-   severity gate + pre-commit docs; PR review via `base..head` ranges).
+3. Milestone three: task-vs-change verification (done: `--task` text/`@file`,
+   deterministic term coverage over symbols/paths/titles/evidence/diff with
+   literal+comment hygiene, `task_check` in `--json` and `--overview`,
+   `--fail-on-task` verdict gate for hooks/CI), LLM escalation (done:
+   `--escalate` evidence-only package — severity floor, item cap, field
+   truncation, token estimates, `schema_version`, task gaps when `--task`
+   is given; Rift never calls a model, it only builds the payload),
+   PR/hook integrations (done: `--fail-on` severity gate, `--install-hook`
+   with marker-guarded reinstall + `--force`, `--format github|junit`
+   for CI with JUnit failures honoring the gate; PR review via
+   `base..head` ranges).
 
 ## Perf baselines (criterion)
 

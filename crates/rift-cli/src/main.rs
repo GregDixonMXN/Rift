@@ -99,13 +99,35 @@ struct Args {
     /// Max items in the package (1..25, bounds LLM tokens/latency/cost).
     #[arg(long, default_value_t = 10)]
     max_escalations: usize,
+
+    /// CI output format (batch only): `github` emits workflow commands,
+    /// `junit` emits JUnit XML. Implies batch; `--json` still wins when
+    /// both are given. JUnit failures use --fail-on (default high).
+    #[arg(long, value_name = "FORMAT")]
+    format: Option<String>,
+
+    /// Install Rift as this repo's pre-commit hook (reviews staged
+    /// changes, blocks on the --fail-on gate, default high) and exit.
+    /// Refuses to clobber a foreign hook without --force.
+    #[arg(long)]
+    install_hook: bool,
+
+    /// Overwrite an existing non-rift pre-commit hook with --install-hook.
+    #[arg(long)]
+    force: bool,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    if args.install_hook {
+        let hook = install_hook(&args)?;
+        println!("rift: installed pre-commit hook at {}", hook.display());
+        return Ok(());
+    }
     // GUI path streams analysis progressively (window first, results land
-    // live). Batch paths (--json/--overview) analyze up front.
-    let batch = args.json || args.overview || args.no_gui;
+    // live). Batch paths (--json/--overview/--escalate/--format) analyze
+    // up front.
+    let batch = args.json || args.overview || args.no_gui || args.escalate || args.format.is_some();
     if batch {
         let cs = build_changeset(&args)?;
         if args.escalate {
@@ -128,6 +150,8 @@ fn main() -> Result<()> {
             );
         } else if args.json {
             println!("{}", serde_json::to_string_pretty(&cs)?);
+        } else if let Some(fmt) = args.format.as_deref() {
+            print!("{}", render_format(&cs, fmt, args.fail_on.as_deref())?);
         } else {
             print!("{}", rift_ui::render_text_overview(&cs));
         }
@@ -359,6 +383,80 @@ fn parse_revs(
     Ok((files, format!("{r1}^"), r1.to_string()))
 }
 
+/// Render a `--format` batch output. `github` emits workflow commands,
+/// `junit` emits JUnit XML whose failures honor the `--fail-on` gate
+/// level (default high). Anything else is a clean error, not guesswork.
+fn render_format(cs: &ChangeSet, fmt: &str, fail_on: Option<&str>) -> Result<String> {
+    match fmt.to_lowercase().as_str() {
+        "github" => Ok(rift_ui::render_github_annotations(cs)),
+        "junit" => {
+            let threshold = match fail_on {
+                Some(level) => parse_severity(level)?,
+                None => rift_core::Severity::High,
+            };
+            Ok(rift_ui::render_junit(cs, threshold))
+        }
+        other => anyhow::bail!("invalid --format '{other}': expected github or junit"),
+    }
+}
+
+/// Marker line identifying hooks Rift owns (safe to reinstall over).
+const HOOK_MARKER: &str = "# installed by `rift --install-hook`";
+
+/// Render the pre-commit hook script for `exe` with a severity gate.
+fn hook_script(exe: &str, fail_on: &str) -> String {
+    format!(
+        "#!/bin/sh\n{HOOK_MARKER} — reviews staged changes, blocks the commit\n\
+         # when a review item reaches the gate (rift exits 2). Re-run\n\
+         # `rift --install-hook` to update; remove this file to uninstall.\n\
+         \"{exe}\" --staged --overview --fail-on {fail_on} || {{\n\
+         \x20 echo \"rift blocked this commit — review the items above.\" >&2\n\
+         \x20 exit 1\n\
+         }}\n"
+    )
+}
+
+/// Install the pre-commit hook into the target repo and return its path.
+/// Bakes in the current binary path plus `--fail-on` (default high).
+/// An existing foreign hook is left alone unless `--force` is given.
+fn install_hook(args: &Args) -> Result<PathBuf> {
+    let engine = open_repo(&args.path)?;
+    let dot_git = Path::new(&engine.root).join(".git");
+    if dot_git.is_file() {
+        anyhow::bail!(
+            "worktree .git indirection is not supported — install from the main checkout at {}",
+            engine.root.display()
+        );
+    }
+    let hooks = dot_git.join("hooks");
+    std::fs::create_dir_all(&hooks)
+        .with_context(|| format!("could not create {}", hooks.display()))?;
+    let dest = hooks.join("pre-commit");
+    if dest.exists() && !args.force {
+        let existing = std::fs::read_to_string(&dest).unwrap_or_default();
+        if !existing.contains(HOOK_MARKER) {
+            anyhow::bail!(
+                "{} already exists and is not a rift hook — re-run with --force to overwrite",
+                dest.display()
+            );
+        }
+    }
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| "rift".to_string());
+    let level = args.fail_on.as_deref().unwrap_or("high");
+    parse_severity(level)?;
+    std::fs::write(&dest, hook_script(&exe, level))
+        .with_context(|| format!("could not write {}", dest.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("could not chmod +x {}", dest.display()))?;
+    }
+    Ok(dest)
+}
+
 /// Parse a `--fail-on` level. Case-insensitive; errors list the valid levels.
 fn parse_severity(level: &str) -> Result<rift_core::Severity> {
     use rift_core::Severity;
@@ -481,6 +579,7 @@ mod tests {
         assert!(gate_trigger(&low, Severity::Medium).is_none());
         assert!(gate_trigger(&low, Severity::Low).is_some());
     }
+
     #[test]
     fn task_text_inline_is_trimmed() {
         assert_eq!(
@@ -554,4 +653,84 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn hook_script_bakes_exe_and_gate() {
+        let s = hook_script("/home/u/.cargo/bin/rift", "critical");
+        assert!(s.starts_with("#!/bin/sh\n"), "{s}");
+        assert!(s.contains(HOOK_MARKER), "{s}");
+        assert!(s.contains("/home/u/.cargo/bin/rift"), "{s}");
+        assert!(s.contains("--staged --overview --fail-on critical"), "{s}");
+    }
+
+    #[test]
+    fn render_format_selects_renderer_and_rejects_unknown() {
+        let cs = cs_with(vec![item("auth", Category::Auth, Severity::High)]);
+        let gh = render_format(&cs, "github", None).unwrap();
+        assert!(gh.contains("::error"), "{gh}");
+        let junit = render_format(&cs, "JUNIT", Some("critical")).unwrap();
+        assert!(junit.contains("failures=\"0\""), "{junit}");
+        assert!(render_format(&cs, "xml-ish", None).is_err());
+        assert!(render_format(&cs, "junit", Some("extreme")).is_err());
+    }
+
+    fn test_args(path: PathBuf) -> Args {
+        Args {
+            path,
+            revs: String::new(),
+            rev2: String::new(),
+            staged: false,
+            commit: None,
+            untracked: true,
+            json: false,
+            overview: false,
+            no_gui: false,
+            no_ai: false,
+            jev: false,
+            jev_local: false,
+            fail_on: None,
+            task: None,
+            fail_on_task: None,
+            escalate: false,
+            escalate_on: "high".into(),
+            max_escalations: 10,
+            format: None,
+            install_hook: true,
+            force: false,
+        }
+    }
+
+    #[test]
+    fn install_hook_writes_executable_marker_hook() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        git2::Repository::init(dir.path()).expect("init");
+        let dest = install_hook(&test_args(dir.path().to_path_buf())).expect("install");
+        assert_eq!(dest, dir.path().join(".git/hooks/pre-commit"));
+        let body = std::fs::read_to_string(&dest).expect("read");
+        assert!(body.contains(HOOK_MARKER), "{body}");
+        assert!(body.contains("--fail-on high"), "{body}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(std::fs::metadata(&dest).expect("meta").permissions().mode() & 0o111, 0o111);
+        }
+        // Reinstall over our own hook is idempotent.
+        install_hook(&test_args(dir.path().to_path_buf())).expect("reinstall");
+    }
+
+    #[test]
+    fn install_hook_refuses_foreign_hook_without_force() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        git2::Repository::init(dir.path()).expect("init");
+        let hooks = dir.path().join(".git/hooks");
+        std::fs::create_dir_all(&hooks).expect("mkdir");
+        std::fs::write(hooks.join("pre-commit"), "#!/bin/sh\necho foreign\n").expect("write");
+        let err = install_hook(&test_args(dir.path().to_path_buf())).unwrap_err();
+        assert!(err.to_string().contains("--force"), "{err}");
+        let mut forced = test_args(dir.path().to_path_buf());
+        forced.force = true;
+        forced.fail_on = Some("critical".into());
+        install_hook(&forced).expect("forced");
+        let body = std::fs::read_to_string(hooks.join("pre-commit")).expect("read");
+        assert!(body.contains("--fail-on critical"), "{body}");
+    }
 }

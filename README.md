@@ -55,20 +55,24 @@ Gate an agent's work on its task description (exit 2 unless Covered):
 
 Install as a pre-commit hook (reviews what you're about to commit):
 
-    cat > .git/hooks/pre-commit <<'EOF'
-    #!/bin/sh
-    rift --staged --overview --fail-on high || {
-      echo "rift blocked this commit — review the items above." >&2
-      exit 1
-    }
-    EOF
-    chmod +x .git/hooks/pre-commit
+    rift --install-hook # bakes in the binary path, gates on high by default
+    rift --install-hook --fail-on critical # stricter gate
+    rift --install-hook --force # overwrite a foreign hook
 
 Review a pull request as a range (needs the base locally):
 
     git fetch origin main && rift main..HEAD --overview
     rift --staged --json --fail-on critical | jq .stats
 
+Machine-readable CI output (implies batch; `--json` still wins):
+
+    rift --staged --format github --fail-on high # workflow commands
+    rift --staged --format junit --fail-on high > rift.xml # dashboards
+
+Minimal GitHub Action:
+
+    - run: cargo install --path crates/rift-cli # or your pinned rift
+    - run: rift main..HEAD --format github --fail-on high
 
 ## LLM escalation
 

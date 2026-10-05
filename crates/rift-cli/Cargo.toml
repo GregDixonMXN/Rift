@@ -18,3 +18,7 @@ rift-ui = { path = "../rift-ui" }
 clap = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+git2 = { workspace = true }
+tempfile = { workspace = true }
