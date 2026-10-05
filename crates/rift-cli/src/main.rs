@@ -74,10 +74,11 @@ struct Args {
     #[arg(long, value_name = "SEVERITY")]
     fail_on: Option<String>,
 
-    /// Task-vs-change check (batch only): verify the diff covers this task.
+    /// Task-vs-change check: verify the diff covers this task.
     /// Inline text (`--task "extend session timeout"`) or `@path` to read
-    /// the description from a file (`--task @task.md`). Prints a coverage
-    /// section in --overview and embeds `task_check` in --json.
+    /// the description from a file (`--task @task.md`). Batch output gets
+    /// a coverage section (--overview) and `task_check` (--json); the GUI
+    /// shows the verdict in Overview.
     #[arg(long, value_name = "TASK")]
     task: Option<String>,
 
@@ -88,11 +89,13 @@ struct Args {
     #[arg(long, value_name = "VERDICT")]
     fail_on_task: Option<String>,
 
-    /// LLM escalation (batch only): emit a compact evidence-only package
-    /// for the riskiest items instead of the full review. Structured facts
-    /// only (titles, symbols, evidence summaries) — never file contents
-    /// or diffs — so the output is safe to pipe to any external model.
-    /// Pairs with --json (package JSON) or --overview (readable summary).
+    /// LLM escalation: emit a compact evidence-only package for the
+    /// riskiest items instead of the full review. Structured facts only
+    /// (titles, symbols, evidence summaries) — never file contents or
+    /// diffs — so the output is safe to pipe to any external model.
+    /// Batch pairs with --json (package JSON) or --overview (readable
+    /// summary); bare `--escalate` opens the GUI on the Escalate view
+    /// (with a copy-JSON button).
     #[arg(long)]
     escalate: bool,
 
@@ -137,9 +140,10 @@ fn main() -> Result<()> {
         return Ok(());
     }
     // GUI path streams analysis progressively (window first, results land
-    // live). Batch paths (--json/--overview/--escalate/--format) analyze
-    // up front.
-    let batch = args.json || args.overview || args.no_gui || args.escalate || args.format.is_some();
+    // live). Batch paths (--json/--overview/--format) analyze up front.
+    // `--escalate` alone opens the GUI Escalate view; with a batch flag
+    // it emits the package instead.
+    let batch = args.json || args.overview || args.no_gui || args.format.is_some();
     if batch {
         let cs = build_changeset(&args)?;
         if args.escalate {
@@ -206,11 +210,6 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
-    if args.task.is_some() {
-        eprintln!(
-            "rift: --task needs --overview, --json, or --no-gui; ignoring it for the GUI run"
-        );
-    }
     if args.fail_on_task.is_some() {
         eprintln!("rift: --fail-on-task needs --overview, --json, or --no-gui; ignoring it for the GUI run");
     }
@@ -225,8 +224,19 @@ fn main() -> Result<()> {
     if args.jev && jev_key.is_none() {
         eprintln!("rift: --jev needs TYPESAFE_API_KEY in the environment; continuing without it");
     }
-    match rift_ui::run_native_progressive(root, base_ref, head_ref, files, jev_key, args.jev_local)
-    {
+    // Task text resolves the same way as batch (`@path` supported);
+    // a bad flag fails here instead of silently reviewing without it.
+    let task_text = resolve_task_text(args.task.as_deref())?;
+    match rift_ui::run_native_progressive(
+        root,
+        base_ref,
+        head_ref,
+        files,
+        jev_key,
+        args.jev_local,
+        task_text,
+        args.escalate,
+    ) {
         Ok(_) => Ok(()),
         Err(e) => {
             eprintln!("rift: GUI unavailable ({e}); printing overview instead.\n");

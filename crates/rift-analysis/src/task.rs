@@ -256,7 +256,11 @@ fn strip_code_literals(s: &str) -> String {
 /// once in a shared table (not cloned per token), and repeated tokens
 /// keep only their first occurrence (matching takes the max over a term,
 /// so duplicates never change a score — only the pair count).
-fn build_corpus(cs: &ChangeSet) -> (Vec<CorpusToken>, Vec<String>) {
+fn build_corpus(
+    files: &[rift_core::FileChange],
+    syms: &[rift_core::SymbolChange],
+    items: &[rift_core::ReviewItem],
+) -> (Vec<CorpusToken>, Vec<String>) {
     let mut corpus = Vec::new();
     let mut vias: Vec<String> = Vec::new();
     // Local fns (not closures) so `corpus` stays pushable at call sites.
@@ -295,7 +299,7 @@ fn build_corpus(cs: &ChangeSet) -> (Vec<CorpusToken>, Vec<String>) {
         }
     }
     let mut seen = HashSet::new();
-    for s in &cs.symbol_changes {
+    for s in syms {
         let via = format!("symbol {}", s.name);
         push_tokens(&mut corpus, &mut vias, &mut seen, &s.name, &via);
         if let Some(sig) = s.new_signature.as_ref().or(s.old_signature.as_ref()) {
@@ -304,7 +308,7 @@ fn build_corpus(cs: &ChangeSet) -> (Vec<CorpusToken>, Vec<String>) {
             push_tokens(&mut corpus, &mut vias, &mut seen, sig, &via);
         }
     }
-    for f in &cs.files {
+    for f in files {
         let p = f.display_path();
         push_tokens(&mut corpus, &mut vias, &mut seen, p, &format!("file {p}"));
         let idx = via_idx(&mut vias, &format!("diff {}", p));
@@ -312,7 +316,7 @@ fn build_corpus(cs: &ChangeSet) -> (Vec<CorpusToken>, Vec<String>) {
             push_token(&mut corpus, &mut seen, t, idx);
         }
     }
-    for r in &cs.review_items {
+    for r in items {
         push_tokens(
             &mut corpus,
             &mut vias,
@@ -515,6 +519,18 @@ fn match_terms(
 
 /// Deterministic task-vs-change check. Pure function of the ChangeSet.
 pub fn check_task(cs: &ChangeSet, task_text: &str) -> TaskCheck {
+    check_task_parts(&cs.files, &cs.symbol_changes, &cs.review_items, task_text)
+}
+
+/// Parts-based check for callers that hold slices, not a ChangeSet (the
+/// GUI worker builds items progressively and must not clone whole files
+/// just to verify a task). Same function, no owned copies.
+pub fn check_task_parts(
+    files: &[rift_core::FileChange],
+    syms: &[rift_core::SymbolChange],
+    items: &[rift_core::ReviewItem],
+    task_text: &str,
+) -> TaskCheck {
     let terms = task_terms(task_text);
     if terms.is_empty() {
         return TaskCheck {
@@ -527,25 +543,24 @@ pub fn check_task(cs: &ChangeSet, task_text: &str) -> TaskCheck {
             verdict: TaskVerdict::Uncovered,
         };
     }
-    let (corpus, vias) = build_corpus(cs);
+    let (corpus, vias) = build_corpus(files, syms, items);
     let term_grams: Vec<Bigrams> = terms.iter().map(|t| bigrams_of(t)).collect();
     let corp_grams: Vec<Bigrams> = corpus.iter().map(|t| bigrams_of(&t.token)).collect();
     let (matched, unmatched) = match_terms(&terms, &term_grams, &corpus, &corp_grams, &vias);
     let coverage = matched.len() as f32 / terms.len() as f32;
 
     // Per-file diff tokens once (many items share files via moves), then
-    // per-item attribution over deduplicated tokens with precomputed
-    // bigrams. Comparisons reuse the corpus bigram cache, so repeated
-    // identifiers across items cost nothing extra.
+    // per-item attribution over deduplicated tokens with lazy per-token
+    // bigrams, so repeated identifiers cost nothing extra.
     let mut file_tokens: HashMap<&str, Vec<String>> = HashMap::new();
-    for f in &cs.files {
+    for f in files {
         file_tokens
             .entry(f.display_path())
             .or_insert_with(|| diff_tokens(f));
     }
     let matched_set: HashSet<&str> = matched.iter().map(|m| m.term.as_str()).collect();
     let mut hits: Vec<TaskItemHit> = Vec::new();
-    for item in &cs.review_items {
+    for item in items {
         let toks = item_corpus(item, &file_tokens);
         // Lazy per-token bigrams: most pairs resolve on ==/substring or
         // the integer prefilter, so building multisets eagerly would

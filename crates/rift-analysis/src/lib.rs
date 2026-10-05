@@ -11,7 +11,7 @@ use rift_parser::{
 use std::collections::HashMap;
 
 pub mod task;
-pub use task::{check_task, render_task_check, split_ident, task_terms};
+pub use task::{check_task, check_task_parts, render_task_check, split_ident, task_terms};
 pub mod escalate;
 pub use escalate::{build_package, render_summary, DEFAULT_FLOOR, DEFAULT_MAX_ITEMS};
 

@@ -1,8 +1,9 @@
 //! Rift graphical review surface (eframe/egui).
-//! Minimal, dense, keyboard-first: Overview / Queue / Files / Diff.
+//! Minimal, dense, keyboard-first: Overview / Queue / Files / Diff / Escalate.
 
 use rift_core::{
-    Category, ChangeSet, ChangeStats, DiffLineKind, FileChange, ReviewItem, Severity, SymbolChange,
+    Category, ChangeSet, ChangeStats, DiffLineKind, EscalationPackage, FileChange, ReviewItem,
+    Severity, SymbolChange, TaskCheck,
 };
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -16,6 +17,7 @@ enum View {
     Files,
     Detail,
     Diff,
+    Escalate,
 }
 
 pub struct RiftApp {
@@ -27,6 +29,9 @@ pub struct RiftApp {
     show_mechanical: bool,
     /// Per-file analysis progress (progressive mode). All true when done.
     analyzed: Vec<bool>,
+    /// Escalation package over the finished review (floor High, cap 10),
+    /// built once in `drain` so the Escalate view renders for free.
+    escalation: Option<EscalationPackage>,
     done: bool,
     rx: Option<mpsc::Receiver<UiMsg>>,
     /// Generation of the analysis this app expects. Stale worker messages
@@ -56,11 +61,13 @@ pub fn is_cancelled(cancel: &AtomicBool) -> bool {
 pub enum UiMsg {
     /// One file's symbols are done (index into `cs.files`).
     Progress { index: usize, generation: u64 },
-    /// Grouping + stats finished.
+    /// Grouping + stats finished (`task_check` when `--task` was given;
+    /// boxed — the channel carries thousands of Progress and few Finished).
     Finished {
         items: Vec<ReviewItem>,
         stats: ChangeStats,
         syms: Vec<SymbolChange>,
+        task_check: Option<Box<TaskCheck>>,
         generation: u64,
     },
 }
@@ -91,6 +98,11 @@ impl RiftApp {
     pub fn new(cs: ChangeSet) -> Self {
         let n = cs.files.len();
         let diff_rows = flatten_diff_rows(&cs.files);
+        let escalation = Some(rift_analysis::build_package(
+            &cs,
+            rift_analysis::DEFAULT_FLOOR,
+            rift_analysis::DEFAULT_MAX_ITEMS,
+        ));
         Self {
             cs,
             view: View::Overview,
@@ -99,6 +111,7 @@ impl RiftApp {
             search: String::new(),
             show_mechanical: false,
             analyzed: vec![true; n],
+            escalation,
             done: true,
             rx: None,
             generation: 0,
@@ -112,6 +125,7 @@ impl RiftApp {
     ///
     /// `generation` tags the expected worker run; `cancel` is signalled on
     /// Drop so the worker exits at its next checkpoint.
+    #[allow(clippy::too_many_arguments)] // UI entry point mirrors the CLI surface; a struct would just move the fields.
     pub fn pending(
         repo_root: String,
         base_ref: String,
@@ -120,6 +134,7 @@ impl RiftApp {
         rx: mpsc::Receiver<UiMsg>,
         generation: u64,
         cancel: Arc<AtomicBool>,
+        start_escalated: bool,
     ) -> Self {
         let n = files.len();
         let diff_rows = flatten_diff_rows(&files);
@@ -139,12 +154,17 @@ impl RiftApp {
         };
         Self {
             cs,
-            view: View::Overview,
+            view: if start_escalated {
+                View::Escalate
+            } else {
+                View::Overview
+            },
             selected: 0,
             file_selected: 0,
             search: String::new(),
             show_mechanical: false,
             analyzed: vec![false; n],
+            escalation: None,
             done: false,
             rx: Some(rx),
             generation,
@@ -176,6 +196,7 @@ impl RiftApp {
                     items,
                     stats,
                     syms,
+                    task_check,
                     generation,
                 } => {
                     if generation != self.generation {
@@ -184,6 +205,14 @@ impl RiftApp {
                     self.cs.review_items = items;
                     self.cs.stats = stats;
                     self.cs.symbol_changes = syms;
+                    self.cs.task_check = task_check.map(|t| *t);
+                    // Package once for the Escalate view; rendering then
+                    // costs nothing per frame.
+                    self.escalation = Some(rift_analysis::build_package(
+                        &self.cs,
+                        rift_analysis::DEFAULT_FLOOR,
+                        rift_analysis::DEFAULT_MAX_ITEMS,
+                    ));
                     self.done = true;
                     self.analyzed.fill(true);
                 }
@@ -261,6 +290,9 @@ pub struct AnalysisParams {
     pub generation: u64,
     /// Use the deterministic (offline) judge instead of the cloud API.
     pub jev_local: bool,
+    /// Task description for the task-vs-change check (checked once the
+    /// review items land, from slices — no copies).
+    pub task: Option<String>,
 }
 
 impl AnalysisParams {
@@ -278,11 +310,17 @@ impl AnalysisParams {
             jev_key,
             generation,
             jev_local: false,
+            task: None,
         }
     }
 
     pub fn with_jev_local(mut self) -> Self {
         self.jev_local = true;
+        self
+    }
+
+    pub fn with_task(mut self, task: Option<String>) -> Self {
+        self.task = task;
         self
     }
 }
@@ -369,10 +407,19 @@ pub fn run_analysis_job(
     if cancelled() {
         return false;
     }
+    // Task check runs on slices — no file copies for the worker.
+    let task_check = params
+        .task
+        .as_deref()
+        .map(|t| Box::new(rift_analysis::check_task_parts(files, &syms_all, &items, t)));
+    if cancelled() {
+        return false;
+    }
     tx.send(UiMsg::Finished {
         items,
         stats,
         syms: syms_all,
+        task_check,
         generation: params.generation,
     })
     .is_ok()
@@ -412,6 +459,9 @@ pub fn load_persistent_cache() -> (rift_parser::SymbolCache, Option<std::path::P
 
 /// Open the window immediately with the file list; parse + score on a worker
 /// thread and stream results in. First paint never waits for analysis.
+/// `task` runs the task-vs-change check in the worker (Overview shows the
+/// verdict); `start_escalated` opens on the Escalate view instead.
+#[allow(clippy::too_many_arguments)] // UI entry point mirrors the CLI surface; a struct would just move the fields.
 pub fn run_native_progressive(
     repo_root: String,
     base_ref: String,
@@ -419,6 +469,8 @@ pub fn run_native_progressive(
     files: Vec<FileChange>,
     jev_key: Option<String>,
     jev_local: bool,
+    task: Option<String>,
+    start_escalated: bool,
 ) -> eframe::Result<()> {
     let mut files = files;
     // Generated flags up front so file_symbols can skip cheaply per file.
@@ -437,6 +489,7 @@ pub fn run_native_progressive(
     if jev_local {
         params = params.with_jev_local();
     }
+    params = params.with_task(task);
     let title = format!("Rift — {} ({} files)", base_ref, files.len());
 
     // Analysis worker: per-file symbols (progress) then grouping + stats.
@@ -477,7 +530,14 @@ pub fn run_native_progressive(
         Box::new(move |cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
             Ok(Box::new(RiftApp::pending(
-                repo_root, base_ref, head_ref, app_files, rx, generation, cancel,
+                repo_root,
+                base_ref,
+                head_ref,
+                app_files,
+                rx,
+                generation,
+                cancel,
+                start_escalated,
             )))
         }),
     )
@@ -510,6 +570,9 @@ impl eframe::App for RiftApp {
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F)) {
             self.view = View::Files;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::E)) {
+            self.view = View::Escalate;
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::N)) {
             // Next meaningful (non-test, non-mechanical) change.
@@ -552,6 +615,7 @@ impl eframe::App for RiftApp {
                         ("Queue", View::Queue),
                         ("Files (f)", View::Files),
                         ("Diff (d)", View::Diff),
+                        ("Escalate (e)", View::Escalate),
                     ];
                     for (label, v) in tabs {
                         if ui.selectable_label(self.view == v, label).clicked() {
@@ -566,7 +630,7 @@ impl eframe::App for RiftApp {
                 if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Slash)) {
                     resp.request_focus();
                 }
-                ui.label("j/k move · enter inspect · esc back · n next meaningful");
+                ui.label("j/k move · enter inspect · esc back · n next meaningful · e escalate");
             });
         });
 
@@ -576,6 +640,7 @@ impl eframe::App for RiftApp {
             View::Files => show_files(self, ctx),
             View::Detail => show_detail(self, ctx),
             View::Diff => show_diff(self, ctx),
+            View::Escalate => show_escalate(self, ctx),
         }
     }
 }
@@ -607,6 +672,41 @@ fn show_overview(app: &mut RiftApp, ctx: &egui::Context) {
                 app.cs.files.len()
             )));
         }
+        if let Some(check) = app.cs.task_check.as_ref() {
+            let pct = (check.coverage * 100.0).round() as u32;
+            ui.collapsing(
+                format!(
+                    "Task check [{:?}] — {}% ({} of {} terms)",
+                    check.verdict,
+                    pct,
+                    check.matched.len(),
+                    check.terms.len()
+                ),
+                |ui| {
+                    ui.label(
+                        egui::RichText::new(format!("task: {}", check.task_text))
+                            .small()
+                            .weak(),
+                    );
+                    if !check.unmatched.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!("missing: {}", check.unmatched.join(", ")))
+                                .small(),
+                        );
+                    }
+                    for h in &check.item_hits {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "• {} [{}]",
+                                h.title,
+                                h.matched_terms.join(", ")
+                            ))
+                            .small(),
+                        );
+                    }
+                },
+            );
+        }
         ui.separator();
         egui::ScrollArea::vertical().show(ui, |ui| {
             let vis = app.visible_items();
@@ -628,6 +728,59 @@ fn show_overview(app: &mut RiftApp, ctx: &egui::Context) {
             }
             if vis.is_empty() {
                 ui.label("No changes match. Working tree is clean or everything is filtered.");
+            }
+        });
+    });
+}
+
+fn show_escalate(app: &mut RiftApp, ctx: &egui::Context) {
+    egui::CentralPanel::default().show(ctx, |ui| {
+        ui.heading("Escalation package — evidence only, never source");
+        let Some(pkg) = app.escalation.as_ref() else {
+            ui.label("Analysis still running — the package lands with the results.");
+            return;
+        };
+        ui.label(format!(
+            "{} item(s) · ~{} tokens · floor {:?} · schema v{}",
+            pkg.items.len(),
+            pkg.approx_tokens,
+            pkg.floor,
+            pkg.schema_version
+        ));
+        if let Some(t) = pkg.task.as_ref() {
+            let gaps = if t.unmatched.is_empty() {
+                "none".to_string()
+            } else {
+                t.unmatched.join(", ")
+            };
+            ui.label(format!("task [{:?}], gaps: {gaps}", t.verdict));
+        }
+        if ui.button("copy package JSON for your model").clicked() {
+            if let Ok(json) = serde_json::to_string_pretty(pkg) {
+                ctx.copy_text(json);
+            }
+        }
+        ui.separator();
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for (i, item) in pkg.items.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.colored_label(sev_color(item.severity), format!("{:?}", item.severity));
+                    ui.label(format!(
+                        "{}. {} (~{} tokens)",
+                        i + 1,
+                        item.title,
+                        item.approx_tokens
+                    ));
+                });
+                if !item.why.is_empty() {
+                    ui.label(egui::RichText::new(&item.why).small().weak());
+                }
+                for e in &item.evidence {
+                    ui.label(egui::RichText::new(format!("• {e}")).small());
+                }
+            }
+            if pkg.items.is_empty() {
+                ui.label("Nothing at or above the floor — nothing to escalate.");
             }
         });
     });
@@ -1280,6 +1433,7 @@ mod tests {
             rx,
             0,
             new_cancel_token(),
+            false,
         );
         assert!(!app.done);
         assert_eq!(app.analyzed_count(), 0);
@@ -1300,6 +1454,7 @@ mod tests {
                 ..Default::default()
             },
             syms: vec![],
+            task_check: None,
             generation: 0,
         })
         .unwrap();
@@ -1322,6 +1477,7 @@ mod tests {
             rx,
             1,
             new_cancel_token(),
+            false,
         );
         // Old run's messages must not touch new-run state.
         tx.send(UiMsg::Progress {
@@ -1340,6 +1496,7 @@ mod tests {
                 ..Default::default()
             },
             syms: vec![],
+            task_check: None,
             generation: 0,
         })
         .unwrap();
@@ -1413,6 +1570,7 @@ mod tests {
             rx,
             3,
             cancel,
+            false,
         );
         assert!(app.drain());
         assert!(app.done);
@@ -1433,6 +1591,72 @@ mod tests {
     }
 
     #[test]
+    fn worker_attaches_task_check() {
+        let (tx, rx) = mpsc::channel();
+        let cancel = new_cancel_token();
+        let mut f = file_with_hunks("src/auth.rs", 1, 1);
+        f.old_content = Some("pub const SESSION_TIMEOUT: u64 = 900;\n".into());
+        f.new_content = Some("pub const SESSION_TIMEOUT: u64 = 86400;\n".into());
+        let files = vec![f];
+        let params = AnalysisParams::new(".".into(), "HEAD".into(), "work".into(), None, 9)
+            .with_task(Some("session timeout".into()));
+        let mut cache = rift_parser::SymbolCache::new();
+        assert!(run_analysis_job(&files, &params, &tx, &cancel, &mut cache));
+        let mut saw_check = false;
+        while let Ok(msg) = rx.try_recv() {
+            if let UiMsg::Finished {
+                task_check,
+                generation,
+                ..
+            } = msg
+            {
+                assert_eq!(generation, 9);
+                let check = task_check.expect("task attached by worker");
+                assert_eq!(check.verdict, rift_core::TaskVerdict::Covered);
+                saw_check = true;
+            }
+        }
+        assert!(saw_check);
+    }
+
+    #[test]
+    fn drain_builds_escalation_and_honors_start_view() {
+        use rift_core::{ChangeStats, Severity};
+        let (tx, rx) = mpsc::channel();
+        let files = vec![file_with_hunks("a.rs", 1, 1)];
+        let mut app = RiftApp::pending(
+            ".".into(),
+            "HEAD".into(),
+            "worktree".into(),
+            files,
+            rx,
+            0,
+            new_cancel_token(),
+            true,
+        );
+        assert_eq!(app.view, View::Escalate);
+        assert!(app.escalation.is_none());
+        let mut hot = item("a", "auth timeout", Category::Auth);
+        hot.severity = Severity::High;
+        tx.send(UiMsg::Finished {
+            items: vec![hot],
+            stats: ChangeStats {
+                files_changed: 1,
+                ..Default::default()
+            },
+            syms: vec![],
+            task_check: None,
+            generation: 0,
+        })
+        .unwrap();
+        assert!(app.drain());
+        assert!(app.done);
+        let pkg = app.escalation.as_ref().expect("package built on finish");
+        assert_eq!(pkg.items.len(), 1);
+        assert_eq!(pkg.items[0].id, "a");
+    }
+
+    #[test]
     fn drop_signals_cancel() {
         let (tx, rx) = mpsc::channel();
         let cancel = new_cancel_token();
@@ -1445,6 +1669,7 @@ mod tests {
                 rx,
                 0,
                 Arc::clone(&cancel),
+                false,
             );
             assert!(!is_cancelled(&cancel));
             let _ = tx;

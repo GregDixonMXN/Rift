@@ -16,6 +16,8 @@ matters, and what deserves human attention — before you merge.
     rift --overview --task @task.md # same, description read from a file
     rift --escalate --json # compact evidence-only package for an external LLM
     rift --escalate --escalate-on medium --max-escalations 5 --json
+    rift --escalate # ...or open the GUI on the Escalate view (copy-JSON button)
+    rift --task @task.md # GUI shows the verdict in Overview too
 
 No accounts, no cloud, no config. Local-first and deterministic: parsing and
 static signals come before any probabilistic judgment, and every conclusion

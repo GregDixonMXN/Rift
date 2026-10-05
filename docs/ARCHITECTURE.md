@@ -65,7 +65,8 @@
    `--fail-on-task` verdict gate for hooks/CI), LLM escalation (done:
    `--escalate` evidence-only package — severity floor, item cap, field
    truncation, token estimates, `schema_version`, task gaps when `--task`
-   is given; Rift never calls a model, it only builds the payload),
+   is given; Rift never calls a model, it only builds the payload; GUI
+   parity: verdict in Overview, Escalate view with copy-JSON),
    PR/hook integrations (done: `--fail-on` severity gate, `--install-hook`
    with marker-guarded reinstall + `--force`, `--format github|junit`
    for CI with JUnit failures honoring the gate; PR review via
