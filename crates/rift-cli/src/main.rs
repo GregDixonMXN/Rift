@@ -83,6 +83,22 @@ struct Args {
     /// requires Covered, while `uncovered` only fails a total miss.
     #[arg(long, value_name = "VERDICT")]
     fail_on_task: Option<String>,
+
+    /// LLM escalation (batch only): emit a compact evidence-only package
+    /// for the riskiest items instead of the full review. Structured facts
+    /// only (titles, symbols, evidence summaries) — never source — so the
+    /// output is safe to pipe to any external model. Pairs with --json
+    /// (package JSON) or --overview (readable summary).
+    #[arg(long)]
+    escalate: bool,
+
+    /// Minimum severity to escalate. Levels: low, medium, high, critical.
+    #[arg(long, default_value = "high", value_name = "SEVERITY")]
+    escalate_on: String,
+
+    /// Max items in the package (1..25, bounds LLM tokens/latency/cost).
+    #[arg(long, default_value_t = 10)]
+    max_escalations: usize,
 }
 
 fn main() -> Result<()> {
@@ -92,7 +108,25 @@ fn main() -> Result<()> {
     let batch = args.json || args.overview || args.no_gui;
     if batch {
         let cs = build_changeset(&args)?;
-        if args.json {
+        if args.escalate {
+            let floor = parse_severity(&args.escalate_on).map_err(|_| {
+                anyhow::anyhow!(
+                    "invalid --escalate-on level '{}': expected low, medium, high, or critical",
+                    args.escalate_on
+                )
+            })?;
+            let pkg = rift_analysis::build_package(&cs, floor, args.max_escalations);
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&pkg)?);
+            } else {
+                print!("{}", rift_analysis::render_summary(&pkg));
+            }
+            eprintln!(
+                "rift: escalated {} item(s), ~{} tokens (evidence only, no source)",
+                pkg.items.len(),
+                pkg.approx_tokens
+            );
+        } else if args.json {
             println!("{}", serde_json::to_string_pretty(&cs)?);
         } else {
             print!("{}", rift_ui::render_text_overview(&cs));
@@ -136,6 +170,9 @@ fn main() -> Result<()> {
     }
     if args.fail_on_task.is_some() {
         eprintln!("rift: --fail-on-task needs --overview, --json, or --no-gui; ignoring it for the GUI run");
+    }
+    if args.escalate {
+        eprintln!("rift: --escalate needs --overview, --json, or --no-gui; ignoring it for the GUI run");
     }
     let engine = open_repo(&args.path)?;
     let root = engine.root.to_string_lossy().replace('\\', "/");

@@ -14,6 +14,8 @@ matters, and what deserves human attention — before you merge.
     rift --jev-local --overview # same evidence kinds, computed offline (no key)
     rift --overview --task "extend session timeout" # task-vs-change coverage check
     rift --overview --task @task.md # same, description read from a file
+    rift --escalate --json # compact evidence-only package for an external LLM
+    rift --escalate --escalate-on medium --max-escalations 5 --json
 
 No accounts, no cloud, no config. Local-first and deterministic: parsing and
 static signals come before any probabilistic judgment, and every conclusion
@@ -66,6 +68,20 @@ Review a pull request as a range (needs the base locally):
 
     git fetch origin main && rift main..HEAD --overview
     rift --staged --json --fail-on critical | jq .stats
+
+
+## LLM escalation
+
+Rift itself never calls an LLM, but `--escalate` builds the package for
+one: the riskiest review items (severity floor, default `high`, cap 10)
+compacted to structured facts — titles, symbols, evidence summaries,
+task gaps. No source, no diffs, no file contents, ever. Token estimates
+are included so callers can budget; `schema_version` guards parsers
+against future field changes:
+
+    rift --escalate --json | jq .approx_tokens
+    rift --escalate --escalate-on medium --task @task.md --json > review.json
+    # then: feed review.json to your model of choice
 
 ## Build
 

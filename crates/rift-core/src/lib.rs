@@ -323,6 +323,57 @@ pub struct TaskCheck {
     pub verdict: TaskVerdict,
 }
 
+/// Schema version of [`EscalationPackage`]. Bump when fields change so
+/// LLM-side parsers can detect drift.
+pub const ESCALATION_SCHEMA_VERSION: u32 = 1;
+
+/// One review item compacted for LLM escalation: structured facts only
+/// (titles, categories, symbol names, evidence summaries, counts).
+/// Never contains source code, diffs, or file contents.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EscalationItem {
+    pub id: String,
+    pub title: String,
+    pub category: Category,
+    pub severity: Severity,
+    pub priority: u8,
+    pub confidence: f32,
+    pub files: Vec<String>,
+    pub symbols: Vec<String>,
+    /// `"kind: summary"` strings, most important first.
+    pub evidence: Vec<String>,
+    pub why: String,
+    /// Rough size estimate (chars / 4, rounded up) for budgeting.
+    pub approx_tokens: u32,
+}
+
+/// Task context attached to an escalation package when `--task` was given.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EscalationTask {
+    pub text: String,
+    pub verdict: TaskVerdict,
+    pub unmatched: Vec<String>,
+}
+
+/// Compact, evidence-only escalation package: everything an external LLM
+/// needs to second-review the riskiest items, and nothing it doesn't.
+/// No source, no diffs, no file contents — safe to pipe to any model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EscalationPackage {
+    pub schema_version: u32,
+    pub base_ref: String,
+    pub head_ref: String,
+    pub floor: Severity,
+    pub files_changed: usize,
+    pub added_lines: usize,
+    pub deleted_lines: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<EscalationTask>,
+    pub items: Vec<EscalationItem>,
+    /// Sum of item estimates plus envelope overhead.
+    pub approx_tokens: u32,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChangeSet {
     pub repo_root: String,
