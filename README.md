@@ -12,6 +12,8 @@ matters, and what deserves human attention — before you merge.
     rift --json           # machine-readable ChangeSet (for agents/tools)
     rift --jev --overview # add Jev risk/severity judgments (needs TYPESAFE_API_KEY)
     rift --jev-local --overview # same evidence kinds, computed offline (no key)
+    rift --overview --task "extend session timeout" # task-vs-change coverage check
+    rift --overview --task @task.md # same, description read from a file
 
 No accounts, no cloud, no config. Local-first and deterministic: parsing and
 static signals come before any probabilistic judgment, and every conclusion

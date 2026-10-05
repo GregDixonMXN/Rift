@@ -93,6 +93,7 @@ fn build_changeset() -> ChangeSet {
         symbol_changes: syms,
         review_items: items,
         stats: Default::default(),
+        task_check: None,
     };
     rift_analysis::fill_stats(&mut cs);
 

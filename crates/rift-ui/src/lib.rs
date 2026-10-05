@@ -135,6 +135,7 @@ impl RiftApp {
             symbol_changes: Vec::new(),
             review_items: Vec::new(),
             stats,
+            task_check: None,
         };
         Self {
             cs,
@@ -929,6 +930,9 @@ pub fn render_text_overview(cs: &ChangeSet) -> String {
             s.push_str(&format!("  - {}\n", m.title));
         }
     }
+    if let Some(check) = cs.task_check.as_ref() {
+        s.push_str(&rift_analysis::render_task_check(check));
+    }
     s
 }
 
@@ -968,6 +972,7 @@ mod tests {
                 mechanical_files: 1,
                 ..Default::default()
             },
+            task_check: None,
         }
     }
 
@@ -1028,6 +1033,26 @@ mod tests {
         let out = render_text_overview(&cs);
         assert!(out.contains("Jev P(risky)=0.72"), "{out}");
         assert!(!out.contains("covered by x"), "{out}");
+    }
+
+
+    #[test]
+    fn text_overview_appends_task_check() {
+        use rift_core::{TaskCheck, TaskVerdict};
+        let mut cs = cs_with(vec![item("a", "auth timeout", Category::Auth)]);
+        assert!(!render_text_overview(&cs).contains("Task check"));
+        cs.task_check = Some(TaskCheck {
+            task_text: "session timeout".into(),
+            terms: vec!["session".into(), "timeout".into()],
+            matched: vec![],
+            unmatched: vec!["session".into(), "timeout".into()],
+            item_hits: vec![],
+            coverage: 0.0,
+            verdict: TaskVerdict::Uncovered,
+        });
+        let out = render_text_overview(&cs);
+        assert!(out.contains("Task check [Uncovered]"), "{out}");
+        assert!(out.contains("session timeout"), "{out}");
     }
 
     fn file_with_hunks(path: &str, hunks: usize, lines: usize) -> FileChange {

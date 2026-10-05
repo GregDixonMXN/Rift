@@ -69,6 +69,13 @@ struct Args {
     /// reaches this severity or higher. Levels: low, medium, high, critical.
     #[arg(long, value_name = "SEVERITY")]
     fail_on: Option<String>,
+
+    /// Task-vs-change check (batch only): verify the diff covers this task.
+    /// Inline text (`--task "extend session timeout"`) or `@path` to read
+    /// the description from a file (`--task @task.md`). Prints a coverage
+    /// section in --overview and embeds `task_check` in --json.
+    #[arg(long, value_name = "TASK")]
+    task: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -95,6 +102,9 @@ fn main() -> Result<()> {
             }
         }
         return Ok(());
+    }
+    if args.task.is_some() {
+        eprintln!("rift: --task needs --overview, --json, or --no-gui; ignoring it for the GUI run");
     }
     let engine = open_repo(&args.path)?;
     let root = engine.root.to_string_lossy().replace('\\', "/");
@@ -176,9 +186,36 @@ fn build_changeset(args: &Args) -> Result<ChangeSet> {
         symbol_changes: syms,
         review_items: items,
         stats: Default::default(),
+        task_check: None,
     };
     rift_analysis::fill_stats(&mut cs);
+    if let Some(task_text) = resolve_task_text(args.task.as_deref())? {
+        cs.task_check = Some(rift_analysis::check_task(&cs, &task_text));
+    }
     Ok(cs)
+}
+
+/// Resolve `--task` text: `@path` reads the description from a file,
+/// anything else is used inline. `None` when the flag is absent.
+fn resolve_task_text(flag: Option<&str>) -> Result<Option<String>> {
+    let Some(raw) = flag else {
+        return Ok(None);
+    };
+    if let Some(path) = raw.strip_prefix('@') {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("could not read task file '{path}'"))?;
+        let trimmed = text.trim().to_string();
+        if trimmed.is_empty() {
+            anyhow::bail!("task file '{path}' is empty");
+        }
+        Ok(Some(trimmed))
+    } else {
+        let trimmed = raw.trim().to_string();
+        if trimmed.is_empty() {
+            anyhow::bail!("--task needs non-empty text (or @path to a task file)");
+        }
+        Ok(Some(trimmed))
+    }
 }
 
 /// Open a repo with a human error when PATH isn't in one. First-run
@@ -310,6 +347,7 @@ mod tests {
             symbol_changes: vec![],
             review_items: items,
             stats: Default::default(),
+            task_check: None,
         }
     }
 
@@ -344,4 +382,29 @@ mod tests {
         assert!(gate_trigger(&low, Severity::Medium).is_none());
         assert!(gate_trigger(&low, Severity::Low).is_some());
     }
+    #[test]
+    fn task_text_inline_is_trimmed() {
+        assert_eq!(
+            resolve_task_text(Some("  extend timeout  ")).unwrap(),
+            Some("extend timeout".to_string())
+        );
+        assert!(resolve_task_text(None).unwrap().is_none());
+        assert!(resolve_task_text(Some("   ")).is_err());
+    }
+
+    #[test]
+    fn task_text_at_path_reads_file() {
+        let dir = std::env::temp_dir().join(format!("rift-task-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("task.md");
+        std::fs::write(&path, "  session timeout work\n").unwrap();
+        let flag = format!("@{}", path.display());
+        assert_eq!(
+            resolve_task_text(Some(&flag)).unwrap(),
+            Some("session timeout work".to_string())
+        );
+        assert!(resolve_task_text(Some("@/nonexistent-rift-task-xyz.md")).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
 }

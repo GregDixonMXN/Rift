@@ -10,6 +10,8 @@ use rift_parser::{
 };
 use std::collections::HashMap;
 
+pub mod task;
+pub use task::{check_task, render_task_check, split_ident, task_terms};
 // ---------------------------------------------------------------------------
 // Pipeline
 // ---------------------------------------------------------------------------

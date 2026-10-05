@@ -288,6 +288,41 @@ pub struct ChangeStats {
     pub symbols_modified: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TaskVerdict {
+    Covered,
+    Partial,
+    Uncovered,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskTermMatch {
+    pub term: String,
+    pub matched_via: String,
+    pub score: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskItemHit {
+    pub item_id: String,
+    pub title: String,
+    pub matched_terms: Vec<String>,
+    /// Fraction of task terms matched by this item (0.0..1.0).
+    pub score: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskCheck {
+    pub task_text: String,
+    pub terms: Vec<String>,
+    pub matched: Vec<TaskTermMatch>,
+    pub unmatched: Vec<String>,
+    pub item_hits: Vec<TaskItemHit>,
+    /// matched.len() / terms.len() (1.0 when there are no terms is 0.0).
+    pub coverage: f32,
+    pub verdict: TaskVerdict,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChangeSet {
     pub repo_root: String,
@@ -297,6 +332,8 @@ pub struct ChangeSet {
     pub symbol_changes: Vec<SymbolChange>,
     pub review_items: Vec<ReviewItem>,
     pub stats: ChangeStats,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_check: Option<TaskCheck>,
 }
 
 impl ChangeSet {
