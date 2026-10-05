@@ -87,4 +87,11 @@ Linux x86_64 (Omarchy, 16-core, release, 2026-10-01):
 - `symbols_many_fn_py_512k`: ~107.98 ms
 - `symbols_minified_js_512k`: ~0.03 ms
 
+Linux x86_64 (i7-13620H, release; task matching after the 2026-10-05
+optimization pass — deduped corpus, interned labels, exact fast path,
+cached bigrams with an integer prefilter, allocation-light tokenizer):
+
+- `task_check_20_files`: ~1.06 ms (was ~6.3 ms before the pass)
+- `task_check_200_files`: ~28.3 ms (was ~207 ms before the pass)
+
 Run: `cargo bench -p rift-parser -p rift-analysis`.

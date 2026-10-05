@@ -352,11 +352,7 @@ pub fn run_analysis_job(
             return false;
         }
         use rift_jev::Judge as _;
-        let _ = rift_jev::DeterministicJudge.judge(
-            &params.base_ref,
-            &params.head_ref,
-            &mut items,
-        );
+        let _ = rift_jev::DeterministicJudge.judge(&params.base_ref, &params.head_ref, &mut items);
         if cancelled() {
             return false;
         }
@@ -454,9 +450,14 @@ pub fn run_native_progressive(
         let wcancel = Arc::clone(&cancel);
         std::thread::spawn(move || {
             let mut cache = cache;
-            run_analysis_job(&wfiles, &wparams, &wtx, &wcancel, &mut cache);
-            if let Some(path) = save_to.as_ref() {
-                let _ = cache.save(path);
+            let finished = run_analysis_job(&wfiles, &wparams, &wtx, &wcancel, &mut cache);
+            // Persist only clean finishes (mirrors spawn_analysis_worker):
+            // a cancelled run's partial cache is valid but stale-adjacent,
+            // and the write is pure overhead on the way out.
+            if finished {
+                if let Some(path) = save_to.as_ref() {
+                    let _ = cache.save(path);
+                }
             }
         });
     }
@@ -895,13 +896,15 @@ pub fn render_text_overview(cs: &ChangeSet) -> String {
         cs.stats.meaningful_changes,
         cs.stats.mechanical_files
     ));
-    for (i, r) in cs.sorted_review_items().iter().enumerate() {
+    let mut n = 0;
+    for r in cs.sorted_review_items() {
         if matches!(r.category, Category::Mechanical) {
             continue;
         }
+        n += 1;
         s.push_str(&format!(
             "{}. [{:?}] {} (priority {}, {:.0}% confidence)\n",
-            i + 1,
+            n,
             r.severity,
             r.title,
             r.priority,
@@ -951,9 +954,15 @@ pub fn render_github_annotations(cs: &ChangeSet) -> String {
             Severity::Medium => "warning",
             Severity::Low => "notice",
         };
-        let mut props = format!("title={:?} {}", r.severity, single_line(&r.title));
+        // Properties escape `:`/`,` too (they delimit properties) —
+        // our titles love commas ("Tests, 2 modified ...").
+        let mut props = format!(
+            "title={:?} {}",
+            r.severity,
+            escape_github_prop(&single_line(&r.title))
+        );
         if let Some(f) = r.files.first() {
-            props = format!("file={},{}", f, props);
+            props = format!("file={},{}", escape_github_prop(f), props);
         }
         let mut msg = single_line(&r.why);
         let ev: Vec<String> = r.evidence.iter().map(|e| e.summary.clone()).collect();
@@ -1013,6 +1022,12 @@ fn escape_github(s: &str) -> String {
         .replace('%', "%25")
         .replace('\r', "%0D")
         .replace('\n', "%0A")
+}
+
+/// Property escaping (`title=`, `file=`): message rules plus `:`/`,`,
+/// which delimit properties (mirrors @actions/core escapeProperty).
+fn escape_github_prop(s: &str) -> String {
+    escape_github(s).replace(':', "%3A").replace(',', "%2C")
 }
 
 fn escape_xml(s: &str) -> String {
@@ -1135,7 +1150,7 @@ mod tests {
 
     #[test]
     fn github_annotations_map_severity_and_escape() {
-        let mut evil = item("e", "100% \"quoted\" title", Category::Auth);
+        let mut evil = item("e", "100% \"quoted\", colon: title", Category::Auth);
         evil.severity = Severity::Critical;
         evil.why = "line one\nline two 100%".into();
         let mut med = item("m", "medium thing", Category::Behavior);
@@ -1148,9 +1163,22 @@ mod tests {
         let out = render_github_annotations(&cs);
         assert!(out.contains("::error file=a.rs,title=Critical"), "{out}");
         assert!(out.contains("100%25"), "{out}");
+        assert!(out.contains("%2C"), "commas escaped in properties: {out}");
+        assert!(out.contains("%3A"), "colons escaped in properties: {out}");
         assert_eq!(out.lines().count(), 2, "messages stay single-line: {out}");
         assert!(out.contains("::warning "), "{out}");
         assert!(!out.contains("lockfile"), "{out}");
+    }
+
+    #[test]
+    fn overview_numbers_skip_mechanical() {
+        // Mechanical sorts anywhere; visible numbering stays 1..N.
+        let mut mech = item("m", "zzz lockfile", Category::Mechanical);
+        mech.severity = Severity::Critical;
+        let cs = cs_with(vec![mech, item("a", "auth timeout", Category::Auth)]);
+        let out = render_text_overview(&cs);
+        assert!(out.contains("\n1. [Medium] auth timeout"), "{out}");
+        assert!(!out.contains("\n2. ["), "{out}");
     }
 
     #[test]
@@ -1163,8 +1191,14 @@ mod tests {
             item("m", "lockfile", Category::Mechanical),
         ]);
         let out = render_junit(&cs, Severity::High);
-        assert!(out.contains("tests=\"3\" failures=\"1\" skipped=\"1\""), "{out}");
-        assert!(out.contains("&lt;timeout&gt; &amp; &quot;friends&quot;"), "{out}");
+        assert!(
+            out.contains("tests=\"3\" failures=\"1\" skipped=\"1\""),
+            "{out}"
+        );
+        assert!(
+            out.contains("&lt;timeout&gt; &amp; &quot;friends&quot;"),
+            "{out}"
+        );
         assert!(out.contains("<skipped/>"), "{out}");
         // Lower threshold fails more.
         let out2 = render_junit(&cs, Severity::Low);
@@ -1399,7 +1433,8 @@ mod tests {
     }
 
     #[test]
-    fn drop_signals_cancel() {        let (tx, rx) = mpsc::channel();
+    fn drop_signals_cancel() {
+        let (tx, rx) = mpsc::channel();
         let cancel = new_cancel_token();
         {
             let _app = RiftApp::pending(

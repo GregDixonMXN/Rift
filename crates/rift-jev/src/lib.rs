@@ -2,11 +2,13 @@
 //!
 //! Design (see `docs/ARCHITECTURE.md`): Jev sits *above* the deterministic
 //! model. State is built ONLY from structured review facts — item titles,
-//! categories, symbol names, evidence summaries, line counts. Raw file
-//! contents are never constructed here (the function signatures take
-//! `&ReviewItem`, which has no source field), so source cannot leak by
-//! accident. One HTTP call per review (fan-out): a Noul risk question and
-//! a Score severity question per behavior-grade item.
+//! categories, symbol names, signatures, evidence summaries, line counts.
+//! File contents and diffs never leave the machine (the function
+//! signatures take `&ReviewItem`, which has no source field), so bulk
+//! source cannot leak by accident. Names and short signatures do travel —
+//! a severity judge cannot work on redacted rectangles — but never the
+//! code they came from. One HTTP call per review (fan-out): a Noul risk
+//! question and a Score severity question per behavior-grade item.
 //!
 //! Uncalibrated by design: answers land as `jev-risk` / `jev-severity`
 //! evidence. Nothing gates, fails, or reorders on them until thresholds
@@ -29,13 +31,22 @@ const SEVERITY_LEVELS: [&str; 3] = [
     "Auth/security, data-loss, or migration impact",
 ];
 
-/// Items worth a judgment: everything except collapsed mechanical output.
+/// Items worth a judgment: everything except collapsed mechanical output,
+/// riskiest first so the MAX_ITEMS cap drops the tamest items, not
+/// whatever the grouping happened to emit first.
 fn judged(items: &[ReviewItem]) -> Vec<&ReviewItem> {
-    items
+    let mut v: Vec<&ReviewItem> = items
         .iter()
         .filter(|i| !matches!(i.category, Category::Mechanical))
-        .take(MAX_ITEMS)
-        .collect()
+        .collect();
+    v.sort_by(|a, b| {
+        b.severity
+            .cmp(&a.severity)
+            .then(b.priority.cmp(&a.priority))
+            .then(a.id.cmp(&b.id))
+    });
+    v.truncate(MAX_ITEMS);
+    v
 }
 
 /// Sendable facts for one item. Titles, categories, symbol names, evidence
@@ -160,12 +171,7 @@ pub enum JevStatus {
 /// source produced them.
 pub trait Judge {
     fn name(&self) -> &'static str;
-    fn judge(
-        &self,
-        base_ref: &str,
-        head_ref: &str,
-        items: &mut [ReviewItem],
-    ) -> JevStatus;
+    fn judge(&self, base_ref: &str, head_ref: &str, items: &mut [ReviewItem]) -> JevStatus;
 }
 
 /// Cloud judge: one HTTP call per review (fan-out). Holds the API key so
@@ -190,12 +196,7 @@ impl Judge for CloudJudge {
         "cloud"
     }
 
-    fn judge(
-        &self,
-        base_ref: &str,
-        head_ref: &str,
-        items: &mut [ReviewItem],
-    ) -> JevStatus {
+    fn judge(&self, base_ref: &str, head_ref: &str, items: &mut [ReviewItem]) -> JevStatus {
         let targets = judged(items);
         if targets.is_empty() {
             return JevStatus::SkippedNoItems;
@@ -210,7 +211,15 @@ impl Judge for CloudJudge {
             .and_then(|a| a.as_object())
             .cloned()
             .unwrap_or_default();
-        let n = targets.len();
+        // Count answers actually applied, not questions asked: an empty
+        // or malformed response judges nothing.
+        let n = targets
+            .iter()
+            .filter(|t| {
+                answers.contains_key(&format!("{}::risk", t.id))
+                    || answers.contains_key(&format!("{}::severity", t.id))
+            })
+            .count();
         apply_answers(items, &answers);
         JevStatus::Applied { items: n }
     }
@@ -233,17 +242,30 @@ impl Judge for DeterministicJudge {
         "deterministic"
     }
 
-    fn judge(
-        &self,
-        _base_ref: &str,
-        _head_ref: &str,
-        items: &mut [ReviewItem],
-    ) -> JevStatus {
-        let ids: Vec<String> = judged(items).iter().map(|i| i.id.clone()).collect();
-        if ids.is_empty() {
+    fn judge(&self, _base_ref: &str, _head_ref: &str, items: &mut [ReviewItem]) -> JevStatus {
+        // Filter by the same rule as `judged` (non-mechanical), not by
+        // id match: duplicate ids must not double-apply, and a mechanical
+        // item sharing an id must not gain judgments. Cap identically.
+        let mut targets: Vec<usize> = items
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| !matches!(i.category, Category::Mechanical))
+            .map(|(n, _)| n)
+            .collect();
+        targets.sort_by(|&a, &b| {
+            items[b]
+                .severity
+                .cmp(&items[a].severity)
+                .then(items[b].priority.cmp(&items[a].priority))
+                .then(items[a].id.cmp(&items[b].id))
+        });
+        targets.truncate(MAX_ITEMS);
+        if targets.is_empty() {
             return JevStatus::SkippedNoItems;
         }
-        for item in items.iter_mut().filter(|i| ids.contains(&i.id)) {
+        let judged_count = targets.len();
+        for n in targets {
+            let item = &mut items[n];
             let mut risk: f64 = 0.15;
             if matches!(
                 item.category,
@@ -284,7 +306,9 @@ impl Judge for DeterministicJudge {
                 &file,
             ));
         }
-        JevStatus::Applied { items: ids.len() }
+        JevStatus::Applied {
+            items: judged_count,
+        }
     }
 }
 
@@ -350,6 +374,47 @@ mod tests {
         }
         assert!(s.contains("login"));
         assert!(s.contains("auth surface"));
+    }
+
+    #[test]
+    fn judged_prefers_riskiest_within_cap() {
+        let mut items = vec![item("file:mech.rs", Category::Mechanical)];
+        for i in 0..30 {
+            let mut it = item(&format!("file:m{i}.rs"), Category::Behavior);
+            it.severity = Severity::Low;
+            it.priority = 10;
+            items.push(it);
+        }
+        let mut hot = item("file:hot.rs", Category::Auth);
+        hot.severity = Severity::Critical;
+        items.push(hot);
+        let req = build_request("HEAD", "work", &items);
+        let q = req["questions"].as_object().unwrap();
+        assert_eq!(q.len(), MAX_ITEMS * 2);
+        assert!(
+            q.contains_key("file:hot.rs::risk"),
+            "critical survives the cap"
+        );
+    }
+
+    #[test]
+    fn deterministic_judge_ignores_mechanical_despite_id() {
+        // A mechanical item must not gain judgments even if its id
+        // collides with nothing; and duplicate ids apply once each.
+        let mut mech = item("file:a.rs", Category::Mechanical);
+        mech.severity = Severity::High;
+        let mut items = vec![mech, item("file:b.rs", Category::Behavior)];
+        let status = DeterministicJudge.judge("H", "w", &mut items);
+        assert!(
+            matches!(status, JevStatus::Applied { items: 1 }),
+            "{status:?}"
+        );
+        assert!(
+            !items[0].evidence.iter().any(|e| e.kind.starts_with("jev-")),
+            "mechanical untouched: {:?}",
+            items[0].evidence
+        );
+        assert!(items[1].evidence.iter().any(|e| e.kind.starts_with("jev-")));
     }
 
     #[test]
@@ -433,15 +498,24 @@ mod tests {
             item("file:gen.rs", Category::Mechanical),
         ];
         let status = judge.judge("H", "w", &mut items);
-        assert!(matches!(status, JevStatus::Applied { items: 1 }), "{status:?}");
+        assert!(
+            matches!(status, JevStatus::Applied { items: 1 }),
+            "{status:?}"
+        );
         let auth = &items[0];
-        assert!(auth.evidence.iter().any(|e| e.kind == "jev-risk"), "{auth:?}");
+        assert!(
+            auth.evidence.iter().any(|e| e.kind == "jev-risk"),
+            "{auth:?}"
+        );
         assert!(
             auth.evidence.iter().any(|e| e.kind == "jev-severity"),
             "{auth:?}"
         );
         assert!(
-            items[1].evidence.iter().all(|e| !e.kind.starts_with("jev-")),
+            items[1]
+                .evidence
+                .iter()
+                .all(|e| !e.kind.starts_with("jev-")),
             "mechanical item must gain no jev evidence: {items:?}"
         );
     }

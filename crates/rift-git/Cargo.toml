@@ -9,3 +9,6 @@ rift-core = { path = "../rift-core" }
 git2 = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

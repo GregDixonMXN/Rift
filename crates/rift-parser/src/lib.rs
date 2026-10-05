@@ -6,8 +6,14 @@ pub mod cache;
 pub use cache::{content_key, default_cache_path, SymbolCache};
 
 use rift_core::{Language, Symbol, SymbolChange, SymbolChangeKind, SymbolKind};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use syn::spanned::Spanned;
+
+/// Contents above this size skip symbol parsing everywhere: oversize
+/// files keep line stats and whole-file entries, never a multi-second
+/// parse. Shared by `file_symbols_cached` and the analysis passes that
+/// parse directly (moves, coverage, blast radius).
+pub const MAX_PARSE_BYTES: usize = 512 * 1024;
 
 // ---------------------------------------------------------------------------
 // Extraction
@@ -185,13 +191,21 @@ fn collect_rust_item(path: &str, item: &syn::Item, impl_ctx: Option<&str>, out: 
             }
         }
         Item::Type(t) => {
+            // Include the right-hand side (capped): without it, `type X =
+            // u32` → `type X = String` is invisible, and the one-line
+            // range hides multi-line alias edits from body comparison.
+            let sl = ident_line(&t.ident);
+            let mut rhs = type_name(&t.ty);
+            if rhs.chars().count() > 120 {
+                rhs = format!("{}…", rhs.chars().take(120).collect::<String>());
+            }
             out.push(Symbol {
                 name: t.ident.to_string(),
                 kind: SymbolKind::TypeAlias,
                 file: path.to_string(),
-                start_line: ident_line(&t.ident),
-                end_line: ident_line(&t.ident),
-                signature: format!("type {}", t.ident),
+                start_line: sl,
+                end_line: token_end(t.semi_token.span(), sl),
+                signature: format!("type {} = {rhs}", t.ident),
                 is_test: false,
                 is_public: matches!(t.vis, syn::Visibility::Public(_)),
             });
@@ -320,7 +334,7 @@ fn walk_ts(
                 });
             }
         }
-        "class_declaration" => {
+        "class_declaration" | "abstract_class_declaration" => {
             if let Some(name) = child_name(&node, src) {
                 out.push(Symbol {
                     name: name.clone(),
@@ -393,14 +407,46 @@ fn walk_ts(
                 });
             }
         }
+        "type_alias_declaration" => {
+            if let Some(name) = child_name(&node, src) {
+                out.push(Symbol {
+                    name: name.clone(),
+                    kind: SymbolKind::TypeAlias,
+                    file: path.to_string(),
+                    start_line: node.start_position().row as u32 + 1,
+                    end_line: node.end_position().row as u32 + 1,
+                    signature: format!("type {name}"),
+                    is_test: false,
+                    is_public: !name.starts_with('_'),
+                });
+            }
+        }
+        "internal_module" => {
+            // `namespace N { ... }`: the hidden `_module` rule inlines,
+            // so the identifier is a direct child.
+            if let Some(name) = child_name(&node, src) {
+                out.push(Symbol {
+                    name: name.clone(),
+                    kind: SymbolKind::Module,
+                    file: path.to_string(),
+                    start_line: node.start_position().row as u32 + 1,
+                    end_line: node.end_position().row as u32 + 1,
+                    signature: format!("namespace {name}"),
+                    is_test: false,
+                    is_public: !name.starts_with('_'),
+                });
+            }
+        }
         "lexical_declaration" | "variable_declaration" => {
-            // const X = (...) => ... / describe/it/test blocks
+            // const X = (...) => ... / describe/it/test blocks.
+            // The name lives on the inner `variable_declarator`, not on
+            // the declaration itself, so look through one level.
             let text = node.utf8_text(src).unwrap_or_default();
             let trimmed = text.trim_start();
             let kw = trimmed.strip_prefix("export").unwrap_or(trimmed);
             let kw = kw.trim_start();
             if kw.starts_with("const ") || kw.starts_with("let ") || kw.starts_with("var ") {
-                if let Some(name) = child_name(&node, src) {
+                if let Some(name) = declarator_name(&node, src).or_else(|| child_name(&node, src)) {
                     let is_test =
                         text.contains("describe(") || text.contains("it(") || name.contains("test");
                     out.push(Symbol {
@@ -430,6 +476,20 @@ fn walk_ts(
             walk_ts(child, path, src, class_ctx, out);
         }
     }
+}
+
+/// Name inside `const X = ...` / `let X = ...`: the declaration node
+/// itself carries no `name` field — it sits on the inner declarator.
+fn declarator_name(node: &tree_sitter::Node, src: &[u8]) -> Option<String> {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "variable_declarator" {
+            if let Some(name) = child_name(&child, src) {
+                return Some(name);
+            }
+        }
+    }
+    None
 }
 
 fn child_name(node: &tree_sitter::Node, src: &[u8]) -> Option<String> {
@@ -535,11 +595,25 @@ fn field_name(node: &tree_sitter::Node, src: &[u8]) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Go method receiver `(s *Server)` → `Server`: last identifier wins.
+/// Go method receiver `(s *Server)` → `Server`.
+/// Generic instantiations are stripped first: `(s *Server[T])` names
+/// `Server`, not the type parameter `T` (the old last-identifier rule
+/// got this wrong).
 fn go_receiver_type(node: &tree_sitter::Node, src: &[u8]) -> Option<String> {
     let recv = node.child_by_field_name("receiver")?;
     let text = recv.utf8_text(src).ok()?;
-    text.rsplit(|c: char| !(c.is_alphanumeric() || c == '_'))
+    let mut depth = 0usize;
+    let mut stripped = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '[' => depth += 1,
+            ']' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => stripped.push(c),
+            _ => {}
+        }
+    }
+    stripped
+        .rsplit(|c: char| !(c.is_alphanumeric() || c == '_'))
         .find(|s| !s.is_empty())
         .map(|s| s.to_string())
 }
@@ -1016,19 +1090,49 @@ fn extract_generic(path: &str, content: &str) -> Vec<Symbol> {
 /// Call-site names inside a body: identifiers immediately followed by `(`.
 /// Used to link tests to the symbols they exercise. Keywords and obvious
 /// non-calls are filtered; the result is sorted and deduplicated.
+///
+/// Two noise guards: `"..."` string contents and `//` line comments are
+/// skipped (mentioning `login()` in a message is not calling it), while
+/// `_`-prefixed helpers count — the extractor emits `_helper` symbols,
+/// so dropping their calls starved private-helper coverage. (Single-quote
+/// strings and `#` comments are left alone: `'` is a lifetime/char quote
+/// in Rust, and guessing wrong eats real code.)
 pub fn called_names(body: &str) -> Vec<String> {
     let chars: Vec<char> = body.chars().collect();
     let mut out = Vec::new();
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
+        // Double-quoted string: skip contents (honor backslash escapes).
+        if c == '"' {
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == '\\' {
+                    i += 2;
+                    continue;
+                }
+                if chars[i] == '"' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        // Line comment: the rest of the line mentions, never calls.
+        if c == '/' && chars.get(i + 1) == Some(&'/') {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
         if c.is_alphabetic() || c == '_' {
             let start = i;
             while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
                 i += 1;
             }
             let name: String = chars[start..i].iter().collect();
-            if chars.get(i) == Some(&'(') && !is_call_keyword(&name) && !name.starts_with('_') {
+            if chars.get(i) == Some(&'(') && !is_call_keyword(&name) && name != "_" {
                 out.push(name);
             }
             continue;
@@ -1106,15 +1210,64 @@ fn is_call_keyword(name: &str) -> bool {
 /// Sorted and deduplicated.
 pub fn imported_names(lang: Language, content: &str) -> Vec<String> {
     let mut out = Vec::new();
+    let mut in_go_block = false;
     for line in content.lines() {
         let t = line.trim();
         match lang {
             Language::Rust => {
-                if let Some(rest) = t.strip_prefix("use ") {
-                    let rest = rest.trim_end_matches(';');
-                    for id in ident_list(rest) {
+                // `use`, `pub use`, `pub(crate) use`, ... — visibility
+                // qualifiers carry no edge information.
+                let mut rest = t;
+                if let Some(after_pub) = rest.strip_prefix("pub") {
+                    let after_pub = after_pub.trim_start();
+                    let after_pub = if after_pub.starts_with('(') {
+                        match after_pub.find(')') {
+                            Some(end) => after_pub[end + 1..].trim_start(),
+                            None => after_pub,
+                        }
+                    } else {
+                        after_pub
+                    };
+                    rest = after_pub;
+                }
+                if let Some(use_rest) = rest.strip_prefix("use ") {
+                    let use_rest = use_rest.trim_end_matches(';');
+                    for id in ident_list(use_rest) {
                         if !matches!(id.as_str(), "crate" | "self" | "super" | "Self") {
                             out.push(id);
+                        }
+                    }
+                }
+            }
+            Language::Go => {
+                // `import "fmt"`, `import log "x/y"`, and `import ( ... )`
+                // blocks. Quoted paths contribute their segments.
+                if t.starts_with("import ") || t.starts_with("import(") {
+                    if t.starts_with("import (") || t == "import(" {
+                        in_go_block = true;
+                    }
+                    for id in ident_list(t) {
+                        if id != "import" {
+                            out.push(id);
+                        }
+                    }
+                } else if in_go_block {
+                    if t == ")" {
+                        in_go_block = false;
+                    } else {
+                        out.extend(ident_list(t));
+                    }
+                }
+            }
+            Language::CSharp => {
+                // `using System.Text;` and `using X = Y;` are directives.
+                // `using (` / `using var` are statements — not edges.
+                if let Some(rest) = t.strip_prefix("using ") {
+                    if !rest.starts_with('(') {
+                        for id in ident_list(rest.trim_end_matches(';')) {
+                            if id != "using" {
+                                out.push(id);
+                            }
                         }
                     }
                 }
@@ -1216,7 +1369,8 @@ fn generic_line(path: &str, t: &str, ln: u32) -> Option<Symbol> {
         is_test: name.contains("test") || t.contains("[Test") || t.contains("@Test"),
         is_public: t.contains("pub ") || t.contains("public "),
     };
-    // Python
+    // Python (`async def` shares the prefix after one strip).
+    let t = t.strip_prefix("async ").unwrap_or(t);
     if let Some(rest) = t.strip_prefix("def ") {
         let name: String = rest
             .chars()
@@ -1264,7 +1418,31 @@ fn generic_line(path: &str, t: &str, ln: u32) -> Option<Symbol> {
             if let Some(name) = before.split_whitespace().last() {
                 let name = name.trim_matches(|c| c == '*' || c == '&').to_string();
                 if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
-                    let skip = ["if", "for", "while", "switch", "catch", "return"];
+                    // Block statements that also match `Name(...) {`:
+                    // `using (…`, `lock (…`, `foreach (…` are C# statements,
+                    // not functions.
+                    let skip = [
+                        "if",
+                        "else",
+                        "elif",
+                        "for",
+                        "foreach",
+                        "while",
+                        "do",
+                        "switch",
+                        "catch",
+                        "try",
+                        "finally",
+                        "throw",
+                        "return",
+                        "using",
+                        "lock",
+                        "fixed",
+                        "checked",
+                        "unchecked",
+                        "unless",
+                        "until",
+                    ];
                     if !skip.contains(&name.as_str()) {
                         return Some(mk(name.clone(), SymbolKind::Function, t.to_string()));
                     }
@@ -1280,9 +1458,17 @@ fn generic_line(path: &str, t: &str, ln: u32) -> Option<Symbol> {
 // ---------------------------------------------------------------------------
 
 /// Match old/new symbol tables for one file and emit SymbolChanges.
-/// Matching key: (kind, name). Signature comparison + body-line overlap
-/// determine Modified vs SignatureChanged. Unmatched pairs with similar
-/// names are reported as Renamed at lower confidence.
+///
+/// Matching key: (kind, name), grouped so overloads and same-name symbols
+/// in different scopes all get compared pairwise instead of overwriting
+/// each other. Signature comparison + body-line overlap determine Modified
+/// vs SignatureChanged; visibility is reported independently so a
+/// pub→private change is never masked by a body edit. Unmatched pairs
+/// with similar names are reported as Renamed at lower confidence.
+///
+/// Deterministic by construction: groups live in a BTreeMap, pairing is
+/// positional, rename matching is best-score with single use, and output
+/// is sorted. No HashMap iteration ever influences the result.
 pub fn diff_symbols(
     file: &str,
     old_syms: &[Symbol],
@@ -1290,126 +1476,156 @@ pub fn diff_symbols(
     old_body: Option<&str>,
     new_body: Option<&str>,
 ) -> Vec<SymbolChange> {
-    let mut out = Vec::new();
-    let mut old_map: HashMap<(String, String), &Symbol> = HashMap::new();
+    type Key = (String, String);
+    let key_of = |s: &Symbol| (format!("{:?}", s.kind), s.name.clone());
+    // Insertion order is source order (deterministic); pairing is positional.
+    let mut old_groups: BTreeMap<Key, Vec<&Symbol>> = BTreeMap::new();
     for s in old_syms {
-        old_map.insert((format!("{:?}", s.kind), s.name.clone()), s);
+        old_groups.entry(key_of(s)).or_default().push(s);
     }
-    let mut new_map: HashMap<(String, String), &Symbol> = HashMap::new();
+    let mut new_groups: BTreeMap<Key, Vec<&Symbol>> = BTreeMap::new();
     for s in new_syms {
-        new_map.insert((format!("{:?}", s.kind), s.name.clone()), s);
+        new_groups.entry(key_of(s)).or_default().push(s);
     }
     // Split once: body comparison touches every matched pair, so per-pair
     // `lines().collect()` goes superlinear on symbol-dense files.
     let old_table: Vec<&str> = old_body.map(|b| b.lines().collect()).unwrap_or_default();
     let new_table: Vec<&str> = new_body.map(|b| b.lines().collect()).unwrap_or_default();
-    for (k, ns) in &new_map {
-        match old_map.get(k) {
-            None => {
-                // Possible rename? Look for same-kind symbol with similar name
-                // that vanished.
-                let rename = old_map.iter().find(|(ok, _)| {
-                    ok.0 == k.0 && !new_map.contains_key(*ok) && str_sim(&ok.1, &k.1) > 0.6
-                });
-                if let Some((_, os)) = rename {
-                    out.push(SymbolChange {
-                        file: file.to_string(),
-                        name: format!("{} → {}", os.name, ns.name),
-                        kind: ns.kind,
-                        change: SymbolChangeKind::Renamed,
-                        confidence: 0.7,
-                        old_signature: Some(os.signature.clone()),
-                        new_signature: Some(ns.signature.clone()),
-                        old_lines: Some((os.start_line, os.end_line)),
-                        new_lines: Some((ns.start_line, ns.end_line)),
-                        evidence: vec![format!(
-                            "same-kind symbol with similar name ({} vs {})",
-                            os.name, ns.name
-                        )],
-                    });
-                } else {
-                    out.push(SymbolChange {
-                        file: file.to_string(),
-                        name: ns.name.clone(),
-                        kind: ns.kind,
-                        change: SymbolChangeKind::Added,
-                        confidence: 0.98,
-                        old_signature: None,
-                        new_signature: Some(ns.signature.clone()),
-                        old_lines: None,
-                        new_lines: Some((ns.start_line, ns.end_line)),
-                        evidence: vec!["no matching symbol in base version".to_string()],
-                    });
-                }
+
+    let mut out = Vec::new();
+    let compare_pair = |os: &Symbol, ns: &Symbol, out: &mut Vec<SymbolChange>| {
+        if os.signature != ns.signature {
+            out.push(SymbolChange {
+                file: file.to_string(),
+                name: ns.name.clone(),
+                kind: ns.kind,
+                change: SymbolChangeKind::SignatureChanged,
+                confidence: 0.95,
+                old_signature: Some(os.signature.clone()),
+                new_signature: Some(ns.signature.clone()),
+                old_lines: Some((os.start_line, os.end_line)),
+                new_lines: Some((ns.start_line, ns.end_line)),
+                evidence: vec![format!(
+                    "signature: '{}' → '{}'",
+                    os.signature, ns.signature
+                )],
+            });
+        } else if bodies_differ(&old_table, &new_table, os, ns) {
+            out.push(SymbolChange {
+                file: file.to_string(),
+                name: ns.name.clone(),
+                kind: ns.kind,
+                change: SymbolChangeKind::Modified,
+                confidence: 0.9,
+                old_signature: Some(os.signature.clone()),
+                new_signature: Some(ns.signature.clone()),
+                old_lines: Some((os.start_line, os.end_line)),
+                new_lines: Some((ns.start_line, ns.end_line)),
+                evidence: vec!["body lines differ".to_string()],
+            });
+        }
+        // Independent of the above: a visibility flip stays visible even
+        // when the signature or body changed in the same edit.
+        if os.is_public != ns.is_public {
+            out.push(SymbolChange {
+                file: file.to_string(),
+                name: ns.name.clone(),
+                kind: ns.kind,
+                change: SymbolChangeKind::VisibilityChanged,
+                confidence: 0.95,
+                old_signature: Some(os.signature.clone()),
+                new_signature: Some(ns.signature.clone()),
+                old_lines: Some((os.start_line, os.end_line)),
+                new_lines: Some((ns.start_line, ns.end_line)),
+                evidence: vec!["visibility flag changed".to_string()],
+            });
+        }
+    };
+
+    // Leftover symbols after exact-key pairing, in deterministic order.
+    let mut free_old: Vec<&Symbol> = Vec::new();
+    let mut free_new: Vec<&Symbol> = Vec::new();
+    let mut keys: Vec<&Key> = old_groups.keys().chain(new_groups.keys()).collect();
+    keys.sort();
+    keys.dedup();
+    for k in keys {
+        let olds = old_groups.get(k).cloned().unwrap_or_default();
+        let news = new_groups.get(k).cloned().unwrap_or_default();
+        let paired = olds.len().min(news.len());
+        for i in 0..paired {
+            compare_pair(olds[i], news[i], &mut out);
+        }
+        free_old.extend(olds.into_iter().skip(paired));
+        free_new.extend(news.into_iter().skip(paired));
+    }
+
+    // Renames: best same-kind match above threshold, each old used once.
+    // Sorted iteration + strict improvement keeps ties deterministic.
+    let mut used_old: Vec<bool> = vec![false; free_old.len()];
+    let mut renamed_old: Vec<bool> = vec![false; free_old.len()];
+    let mut added: Vec<&Symbol> = Vec::new();
+    for ns in &free_new {
+        let mut best: Option<(usize, f32)> = None;
+        for (i, os) in free_old.iter().enumerate() {
+            if used_old[i] || os.kind != ns.kind {
+                continue;
             }
-            Some(os) => {
-                if os.signature != ns.signature {
-                    out.push(SymbolChange {
-                        file: file.to_string(),
-                        name: ns.name.clone(),
-                        kind: ns.kind,
-                        change: SymbolChangeKind::SignatureChanged,
-                        confidence: 0.95,
-                        old_signature: Some(os.signature.clone()),
-                        new_signature: Some(ns.signature.clone()),
-                        old_lines: Some((os.start_line, os.end_line)),
-                        new_lines: Some((ns.start_line, ns.end_line)),
-                        evidence: vec![format!(
-                            "signature: '{}' → '{}'",
-                            os.signature, ns.signature
-                        )],
-                    });
-                } else if bodies_differ(&old_table, &new_table, os, ns) {
-                    out.push(SymbolChange {
-                        file: file.to_string(),
-                        name: ns.name.clone(),
-                        kind: ns.kind,
-                        change: SymbolChangeKind::Modified,
-                        confidence: 0.9,
-                        old_signature: Some(os.signature.clone()),
-                        new_signature: Some(ns.signature.clone()),
-                        old_lines: Some((os.start_line, os.end_line)),
-                        new_lines: Some((ns.start_line, ns.end_line)),
-                        evidence: vec!["body lines differ".to_string()],
-                    });
-                } else if os.is_public != ns.is_public {
-                    out.push(SymbolChange {
-                        file: file.to_string(),
-                        name: ns.name.clone(),
-                        kind: ns.kind,
-                        change: SymbolChangeKind::VisibilityChanged,
-                        confidence: 0.95,
-                        old_signature: Some(os.signature.clone()),
-                        new_signature: Some(ns.signature.clone()),
-                        old_lines: Some((os.start_line, os.end_line)),
-                        new_lines: Some((ns.start_line, ns.end_line)),
-                        evidence: vec!["visibility flag changed".to_string()],
-                    });
-                }
+            let sim = str_sim(&os.name, &ns.name);
+            if sim > 0.6 && best.map(|(_, b)| sim > b).unwrap_or(true) {
+                best = Some((i, sim));
             }
         }
-    }
-    for (k, os) in &old_map {
-        if !new_map.contains_key(k) {
-            // Already reported as rename target?
-            let renamed = out.iter().any(|c| {
-                matches!(c.change, SymbolChangeKind::Renamed)
-                    && c.name.starts_with(&format!("{} →", os.name))
+        if let Some((i, _)) = best {
+            used_old[i] = true;
+            renamed_old[i] = true;
+            let os = free_old[i];
+            out.push(SymbolChange {
+                file: file.to_string(),
+                name: format!("{} → {}", os.name, ns.name),
+                kind: ns.kind,
+                change: SymbolChangeKind::Renamed,
+                confidence: 0.7,
+                old_signature: Some(os.signature.clone()),
+                new_signature: Some(ns.signature.clone()),
+                old_lines: Some((os.start_line, os.end_line)),
+                new_lines: Some((ns.start_line, ns.end_line)),
+                evidence: vec![format!(
+                    "same-kind symbol with similar name ({} vs {})",
+                    os.name, ns.name
+                )],
             });
-            if !renamed {
-                out.push(SymbolChange {
-                    file: file.to_string(),
-                    name: os.name.clone(),
-                    kind: os.kind,
-                    change: SymbolChangeKind::Removed,
-                    confidence: 0.95,
-                    old_signature: Some(os.signature.clone()),
-                    new_signature: None,
-                    old_lines: Some((os.start_line, os.end_line)),
-                    new_lines: None,
-                    evidence: vec!["symbol absent from new version".to_string()],
-                });
-            }
+        } else {
+            added.push(ns);
+        }
+    }
+    for ns in added {
+        out.push(SymbolChange {
+            file: file.to_string(),
+            name: ns.name.clone(),
+            kind: ns.kind,
+            change: SymbolChangeKind::Added,
+            confidence: 0.98,
+            old_signature: None,
+            new_signature: Some(ns.signature.clone()),
+            old_lines: None,
+            new_lines: Some((ns.start_line, ns.end_line)),
+            evidence: vec!["no matching symbol in base version".to_string()],
+        });
+    }
+    for (i, os) in free_old.iter().enumerate() {
+        if !renamed_old[i] {
+            out.push(SymbolChange {
+                file: file.to_string(),
+                name: os.name.clone(),
+                kind: os.kind,
+                change: SymbolChangeKind::Removed,
+                confidence: 0.95,
+                old_signature: Some(os.signature.clone()),
+                new_signature: None,
+                old_lines: Some((os.start_line, os.end_line)),
+                new_lines: None,
+                evidence: vec!["symbol absent from new version".to_string()],
+            });
         }
     }
     out.sort_by(|a, b| a.file.cmp(&b.file).then(a.name.cmp(&b.name)));
@@ -1458,6 +1674,18 @@ fn str_sim(a: &str, b: &str) -> f32 {
     if a == b {
         return 1.0;
     }
+    // Exact integer bound first (see task.rs `dice_possible`): pairs
+    // that cannot reach the 0.6 rename threshold skip both lowercase
+    // copies and both bigram tables. ASCII-only: lowercasing can change
+    // char counts for exotic Unicode (İ → i̇), which would void the bound;
+    // non-ASCII pairs always run the full comparison.
+    if a.is_ascii() && b.is_ascii() {
+        let (ca, cb) = (a.len(), b.len());
+        let (ba, bb) = (ca.saturating_sub(1).max(1), cb.saturating_sub(1).max(1));
+        if 2 * ba.min(bb) * 10 < 6 * (ba + bb) {
+            return 0.0;
+        }
+    }
     let bigrams = |s: &str| -> Vec<String> {
         let c: Vec<char> = s.chars().collect();
         if c.len() < 2 {
@@ -1497,6 +1725,19 @@ mod tests {
     }
 
     #[test]
+    fn ts_arrow_const_and_abstract_class_detected() {
+        let src = "export const useAuth = () => { return 1; }\nabstract class Auth {\n  login() { return 2; }\n}\ntype Alias = string;\nnamespace N {\n  export function f() { return 3; }\n}\n";
+        let s = extract_symbols("a.ts", Language::TypeScript, src);
+        let names: Vec<&str> = s.iter().map(|x| x.name.as_str()).collect();
+        assert!(names.contains(&"useAuth"), "{names:?}");
+        assert!(names.contains(&"Auth"), "{names:?}");
+        assert!(names.contains(&"Auth::login"), "{names:?}");
+        assert!(names.contains(&"Alias"), "{names:?}");
+        assert!(names.contains(&"N"), "{names:?}");
+        assert!(names.contains(&"f"), "{names:?}");
+    }
+
+    #[test]
     fn ts_function_added() {
         let old = "export function a() { return 1; }";
         let new = "export function a() { return 1; }\nexport function b() { return 2; }";
@@ -1506,6 +1747,67 @@ mod tests {
         assert!(d
             .iter()
             .any(|c| c.name == "b" && matches!(c.change, SymbolChangeKind::Added)));
+    }
+
+    #[test]
+    fn go_generic_receiver_names_type_not_parameter() {
+        let src = "package s\nfunc (s *Server[T]) Handle() {}\nfunc (s Server) Plain() {}\n";
+        let s = extract_symbols("a.go", Language::Go, src);
+        let names: Vec<&str> = s.iter().map(|x| x.name.as_str()).collect();
+        assert!(names.contains(&"Server::Handle"), "{names:?}");
+        assert!(names.contains(&"Server::Plain"), "{names:?}");
+        assert!(!names.iter().any(|n| n.starts_with("T::")), "{names:?}");
+    }
+
+    #[test]
+    fn rust_type_alias_rhs_change_detected() {
+        let old = "type X =\n    u32;\n";
+        let new = "type X =\n    String;\n";
+        let o = extract_symbols("a.rs", Language::Rust, old);
+        let n = extract_symbols("a.rs", Language::Rust, new);
+        assert_eq!(o[0].signature, "type X = u32", "{o:?}");
+        let d = diff_symbols("a.rs", &o, &n, Some(old), Some(new));
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].change, SymbolChangeKind::SignatureChanged);
+    }
+
+    #[test]
+    fn called_names_skips_strings_comments_keeps_private() {
+        let body = "let v = _login(user);\nlet m = \"login() failed\";\n// see save(x)\nreal();";
+        let calls = called_names(body);
+        assert!(calls.contains(&"_login".to_string()), "{calls:?}");
+        assert!(calls.contains(&"real".to_string()), "{calls:?}");
+        assert!(!calls.contains(&"login".to_string()), "{calls:?}");
+        assert!(!calls.contains(&"save".to_string()), "{calls:?}");
+    }
+
+    #[test]
+    fn imports_cover_pub_use_go_and_csharp() {
+        let rust = "pub use foo::bar;\npub(crate) use x::Y;\nuse crate::z;\n";
+        let im = imported_names(Language::Rust, rust);
+        assert!(im.contains(&"bar".to_string()), "{im:?}");
+        assert!(im.contains(&"Y".to_string()), "{im:?}");
+        let go = "package a\nimport \"fmt\"\nimport (\n\t\"os\"\n\tlog \"x/y\"\n)\n";
+        let im = imported_names(Language::Go, go);
+        assert!(im.contains(&"fmt".to_string()), "{im:?}");
+        assert!(im.contains(&"os".to_string()), "{im:?}");
+        assert!(im.contains(&"log".to_string()), "{im:?}");
+        let cs = "using System.Text;\nusing IO = System.IO;\nvoid M() {\n using (var c = Open()) {}\n}\n";
+        let im = imported_names(Language::CSharp, cs);
+        assert!(im.contains(&"Text".to_string()), "{im:?}");
+        assert!(im.contains(&"IO".to_string()), "{im:?}");
+        assert!(!im.contains(&"var".to_string()), "{im:?}");
+    }
+
+    #[test]
+    fn fallback_async_def_and_block_statements() {
+        // Unsupported extensions fall back to line patterns.
+        let py = extract_symbols("fallback.pyx", Language::Unknown, "async def fetch():\n");
+        assert!(py.iter().any(|x| x.name == "fetch"), "{py:?}");
+        let cs = extract_symbols("b.csx", Language::Unknown, "using (var c = Open()) {\n");
+        assert!(!cs.iter().any(|x| x.name == "using"), "{cs:?}");
+        let lp = extract_symbols("c.csx", Language::Unknown, "lock (obj) {\n");
+        assert!(!lp.iter().any(|x| x.name == "lock"), "{lp:?}");
     }
 
     #[test]
@@ -1526,6 +1828,87 @@ mod tests {
         let d = diff_symbols("x.rs", &o, &n, Some(old), Some(new));
         assert_eq!(d.len(), 1, "only b changed: {d:?}");
         assert_eq!(d[0].name, "b");
+    }
+
+    fn sym(name: &str, kind: SymbolKind, sig: &str, pub_: bool) -> Symbol {
+        Symbol {
+            name: name.into(),
+            kind,
+            file: "f.rs".into(),
+            start_line: 1,
+            end_line: 3,
+            signature: sig.into(),
+            is_test: false,
+            is_public: pub_,
+        }
+    }
+
+    #[test]
+    fn overloads_compare_pairwise_without_dropping() {
+        // Two same-name methods: change only the second overload's body.
+        let o1 = sym("Auth::Login", SymbolKind::Method, "Login()", true);
+        let mut o2 = sym("Auth::Login", SymbolKind::Method, "Login(x)", true);
+        o2.start_line = 10;
+        o2.end_line = 12;
+        let n1 = o1.clone();
+        let n2 = o2.clone();
+        let old_body = "a\n1\na\nx\nx\nx\nx\nx\nx\nb\n2\nb";
+        let new_body = "a\n1\na\nx\nx\nx\nx\nx\nx\nb\n3\nb";
+        let d = diff_symbols("f.rs", &[o1, o2], &[n1, n2], Some(old_body), Some(new_body));
+        assert_eq!(d.len(), 1, "only the second overload changed: {d:?}");
+        assert_eq!(d[0].change, SymbolChangeKind::Modified);
+    }
+
+    #[test]
+    fn rename_source_used_once_and_stable() {
+        let old = vec![sym("foobar", SymbolKind::Function, "foobar()", true)];
+        let new = vec![
+            sym("foobaz", SymbolKind::Function, "foobaz()", true),
+            sym("foobar2", SymbolKind::Function, "foobar2()", true),
+        ];
+        let d = diff_symbols("f.rs", &old, &new, None, None);
+        let renamed: Vec<_> = d
+            .iter()
+            .filter(|c| matches!(c.change, SymbolChangeKind::Renamed))
+            .collect();
+        // One old symbol births at most one rename; the other is Added.
+        // No Removed either (the old was consumed by the rename).
+        assert_eq!(renamed.len(), 1, "{d:?}");
+        assert_eq!(d.len(), 2, "{d:?}");
+        assert!(d
+            .iter()
+            .any(|c| matches!(c.change, SymbolChangeKind::Added)));
+        // Deterministic: same inputs, same outputs, every run.
+        let d2 = diff_symbols("f.rs", &old, &new, None, None);
+        assert_eq!(
+            d.iter().map(|c| &c.name).collect::<Vec<_>>(),
+            d2.iter().map(|c| &c.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn visibility_change_survives_body_change() {
+        let old = sym("f", SymbolKind::Function, "f()", true);
+        let new = sym("f", SymbolKind::Function, "f()", false);
+        let old_body = "pub fn f() {\n1\n}";
+        let new_body = "fn f() {\n2\n}";
+        let d = diff_symbols(
+            "f.rs",
+            std::slice::from_ref(&old),
+            std::slice::from_ref(&new),
+            Some(old_body),
+            Some(new_body),
+        );
+        assert!(
+            d.iter()
+                .any(|c| matches!(c.change, SymbolChangeKind::Modified)),
+            "{d:?}"
+        );
+        assert!(
+            d.iter()
+                .any(|c| matches!(c.change, SymbolChangeKind::VisibilityChanged)),
+            "{d:?}"
+        );
     }
 
     #[test]

@@ -14,11 +14,14 @@ use std::path::{Path, PathBuf};
     about = "What actually changed? — semantic code-change review"
 )]
 struct Args {
-    /// Repository path (default: current directory).
+    /// Repository path (default: current directory). A first positional
+    /// that isn't a path reads as revisions instead (`rift main..HEAD`,
+    /// `rift main HEAD`, `rift <sha>`).
     #[arg(default_value = ".")]
     path: PathBuf,
 
     /// Revisions: commit SHA, `base..head`, or branch names.
+    /// With an explicit path first: `rift <path> main..HEAD`.
     #[arg(default_value_t = String::new())]
     revs: String,
 
@@ -56,7 +59,8 @@ struct Args {
 
     /// Ask Jev (TypeSafe cloud API) for risk/severity judgments on each
     /// behavior-grade item. Requires TYPESAFE_API_KEY. Sends structured
-    /// facts only (symbols, evidence summaries, counts) — never source.
+    /// facts only (symbols, signatures, evidence summaries, counts) —
+    /// never file contents or diffs.
     #[arg(long)]
     jev: bool,
 
@@ -86,9 +90,9 @@ struct Args {
 
     /// LLM escalation (batch only): emit a compact evidence-only package
     /// for the riskiest items instead of the full review. Structured facts
-    /// only (titles, symbols, evidence summaries) — never source — so the
-    /// output is safe to pipe to any external model. Pairs with --json
-    /// (package JSON) or --overview (readable summary).
+    /// only (titles, symbols, evidence summaries) — never file contents
+    /// or diffs — so the output is safe to pipe to any external model.
+    /// Pairs with --json (package JSON) or --overview (readable summary).
     #[arg(long)]
     escalate: bool,
 
@@ -96,7 +100,7 @@ struct Args {
     #[arg(long, default_value = "high", value_name = "SEVERITY")]
     escalate_on: String,
 
-    /// Max items in the package (1..25, bounds LLM tokens/latency/cost).
+    /// Max items in the package (0..25, bounds LLM tokens/latency/cost).
     #[arg(long, default_value_t = 10)]
     max_escalations: usize,
 
@@ -118,7 +122,15 @@ struct Args {
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
+    // Positional repair: `path` eats the first positional, so revision
+    // forms only work when reinterpreted. A positional that exists on
+    // disk stays a repo path; otherwise it shifts into revision slots:
+    // `rift main..HEAD`, `rift main HEAD`, `rift <sha>`.
+    let (dir, r1, r2) = split_positionals(&args.path.to_string_lossy(), &args.revs, &args.rev2);
+    args.path = dir.into();
+    args.revs = r1;
+    args.rev2 = r2;
     if args.install_hook {
         let hook = install_hook(&args)?;
         println!("rift: installed pre-commit hook at {}", hook.display());
@@ -131,6 +143,11 @@ fn main() -> Result<()> {
     if batch {
         let cs = build_changeset(&args)?;
         if args.escalate {
+            if args.format.is_some() {
+                anyhow::bail!(
+                    "--escalate and --format conflict: pick the package or the CI rendering"
+                );
+            }
             let floor = parse_severity(&args.escalate_on).map_err(|_| {
                 anyhow::anyhow!(
                     "invalid --escalate-on level '{}': expected low, medium, high, or critical",
@@ -190,13 +207,12 @@ fn main() -> Result<()> {
         return Ok(());
     }
     if args.task.is_some() {
-        eprintln!("rift: --task needs --overview, --json, or --no-gui; ignoring it for the GUI run");
+        eprintln!(
+            "rift: --task needs --overview, --json, or --no-gui; ignoring it for the GUI run"
+        );
     }
     if args.fail_on_task.is_some() {
         eprintln!("rift: --fail-on-task needs --overview, --json, or --no-gui; ignoring it for the GUI run");
-    }
-    if args.escalate {
-        eprintln!("rift: --escalate needs --overview, --json, or --no-gui; ignoring it for the GUI run");
     }
     let engine = open_repo(&args.path)?;
     let root = engine.root.to_string_lossy().replace('\\', "/");
@@ -209,7 +225,8 @@ fn main() -> Result<()> {
     if args.jev && jev_key.is_none() {
         eprintln!("rift: --jev needs TYPESAFE_API_KEY in the environment; continuing without it");
     }
-    match rift_ui::run_native_progressive(root, base_ref, head_ref, files, jev_key, args.jev_local) {
+    match rift_ui::run_native_progressive(root, base_ref, head_ref, files, jev_key, args.jev_local)
+    {
         Ok(_) => Ok(()),
         Err(e) => {
             eprintln!("rift: GUI unavailable ({e}); printing overview instead.\n");
@@ -240,7 +257,11 @@ fn build_changeset(args: &Args) -> Result<ChangeSet> {
             eprintln!("rift: symbol cache save skipped ({e})");
         }
     }
-    if args.jev_local && (args.json || args.overview || args.no_gui) {
+    // Batch output selectors: enrichment applies to every batch form,
+    // including --escalate/--format (their renderers surface evidence).
+    let batch_out =
+        args.json || args.overview || args.no_gui || args.escalate || args.format.is_some();
+    if args.jev_local && batch_out {
         use rift_jev::Judge as _;
         match rift_jev::DeterministicJudge.judge(&base_ref, &head_ref, &mut items) {
             rift_jev::JevStatus::Applied { items: n } => {
@@ -251,7 +272,7 @@ fn build_changeset(args: &Args) -> Result<ChangeSet> {
                 eprintln!("rift: jev-local skipped ({other:?}); review continues without it");
             }
         }
-    } else if args.jev && (args.json || args.overview || args.no_gui) {
+    } else if args.jev && batch_out {
         match rift_jev::enrich(
             &base_ref,
             &head_ref,
@@ -259,7 +280,7 @@ fn build_changeset(args: &Args) -> Result<ChangeSet> {
             std::env::var("TYPESAFE_API_KEY").ok().as_deref(),
         ) {
             rift_jev::JevStatus::Applied { items: n } => {
-                eprintln!("rift: jev judged {n} items (structured facts only, no source sent)");
+                eprintln!("rift: jev judged {n} items (facts only, no file contents sent)");
             }
             rift_jev::JevStatus::SkippedNoKey => {
                 eprintln!("rift: --jev needs TYPESAFE_API_KEY in the environment; skipping");
@@ -359,11 +380,46 @@ fn resolve_files(
     ))
 }
 
+/// Split raw positionals into (repo dir, revs, rev2). Pure function —
+/// the filesystem check is the only I/O (`Path::exists`).
+fn split_positionals(path: &str, revs: &str, rev2: &str) -> (String, String, String) {
+    // Explicit revision slots win; an existing path stays a path.
+    if !revs.is_empty() {
+        if rev2.is_empty() && !std::path::Path::new(path).exists() && looks_like_revs(path) {
+            // `rift main HEAD`: first positional is the base revision.
+            return (".".to_string(), path.to_string(), revs.to_string());
+        }
+        return (path.to_string(), revs.to_string(), rev2.to_string());
+    }
+    // One positional: `..` always means revisions; otherwise a missing
+    // slashless name reads as a revision (`<sha>`, branch) while anything
+    // with a path separator stays a path (keeps the friendly not-a-repo
+    // error for typo'd or deleted directories).
+    if path != "."
+        && (path.contains("..") || looks_like_revs(path) && !std::path::Path::new(path).exists())
+    {
+        return (".".to_string(), path.to_string(), String::new());
+    }
+    (path.to_string(), revs.to_string(), rev2.to_string())
+}
+
+/// A single positional reads as revisions when it has range syntax or
+/// no path separator (a typo'd path still errors, just later at
+/// rev-parse time with libgit2's message).
+fn looks_like_revs(s: &str) -> bool {
+    s.contains("..") || (!s.contains('/') && !s.contains('\\'))
+}
+
 fn parse_revs(
     engine: &rift_git::GitEngine,
     r1: &str,
     r2: &str,
 ) -> Result<(Vec<rift_core::FileChange>, String, String)> {
+    // `base...head` (three-dot) is GitHub-compare syntax, not a diff
+    // range Rift computes — fail loudly instead of parsing `.feature`.
+    if r1.contains("...") {
+        anyhow::bail!("three-dot ranges (`...`) aren't supported — use `base..head` (two-dot)");
+    }
     // `base..head` form.
     if let Some((b, h)) = r1.split_once("..") {
         let base = b.trim();
@@ -403,16 +459,29 @@ fn render_format(cs: &ChangeSet, fmt: &str, fail_on: Option<&str>) -> Result<Str
 /// Marker line identifying hooks Rift owns (safe to reinstall over).
 const HOOK_MARKER: &str = "# installed by `rift --install-hook`";
 
+/// POSIX shell-quote: single quotes with embedded quotes escaped.
+/// Double quotes would still interpolate `$`, backticks, and `\`.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 /// Render the pre-commit hook script for `exe` with a severity gate.
+/// Only a gate trip (exit 2) blocks the commit; tool failures warn and
+/// let the commit through — a broken review tool must not brick commits.
 fn hook_script(exe: &str, fail_on: &str) -> String {
+    let exe = shell_quote(exe);
     format!(
         "#!/bin/sh\n{HOOK_MARKER} — reviews staged changes, blocks the commit\n\
          # when a review item reaches the gate (rift exits 2). Re-run\n\
          # `rift --install-hook` to update; remove this file to uninstall.\n\
-         \"{exe}\" --staged --overview --fail-on {fail_on} || {{\n\
+         {exe} --staged --overview --fail-on {fail_on}\n\
+         status=$?\n\
+         if [ $status -eq 2 ]; then\n\
          \x20 echo \"rift blocked this commit — review the items above.\" >&2\n\
          \x20 exit 1\n\
-         }}\n"
+         elif [ $status -ne 0 ]; then\n\
+         \x20 echo \"rift pre-commit check failed to run (exit $status) — committing anyway.\" >&2\n\
+         fi\n"
     )
 }
 
@@ -421,14 +490,16 @@ fn hook_script(exe: &str, fail_on: &str) -> String {
 /// An existing foreign hook is left alone unless `--force` is given.
 fn install_hook(args: &Args) -> Result<PathBuf> {
     let engine = open_repo(&args.path)?;
-    let dot_git = Path::new(&engine.root).join(".git");
-    if dot_git.is_file() {
+    // The git dir (not `root/.git`): bare repos have no workdir, so
+    // `root` already *is* the git dir there.
+    let git_dir = engine.git_dir();
+    if git_dir.join("commondir").exists() || Path::new(&engine.root).join(".git").is_file() {
         anyhow::bail!(
-            "worktree .git indirection is not supported — install from the main checkout at {}",
+            "linked worktrees keep hooks in the main checkout — install there instead ({})",
             engine.root.display()
         );
     }
-    let hooks = dot_git.join("hooks");
+    let hooks = git_dir.join("hooks");
     std::fs::create_dir_all(&hooks)
         .with_context(|| format!("could not create {}", hooks.display()))?;
     let dest = hooks.join("pre-commit");
@@ -441,6 +512,8 @@ fn install_hook(args: &Args) -> Result<PathBuf> {
             );
         }
     }
+    // Forward slashes suit the sh hook on every platform; lossy display
+    // only matters for exotic non-UTF8 install paths.
     let exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().replace('\\', "/"))
         .unwrap_or_else(|_| "rift".to_string());
@@ -465,7 +538,9 @@ fn parse_severity(level: &str) -> Result<rift_core::Severity> {
         "medium" | "med" => Ok(Severity::Medium),
         "high" => Ok(Severity::High),
         "critical" | "crit" => Ok(Severity::Critical),
-        other => anyhow::bail!("invalid --fail-on level '{other}': expected low, medium, high, or critical"),
+        other => anyhow::bail!(
+            "invalid --fail-on level '{other}': expected low, medium, high, or critical"
+        ),
     }
 }
 
@@ -658,8 +733,49 @@ mod tests {
         let s = hook_script("/home/u/.cargo/bin/rift", "critical");
         assert!(s.starts_with("#!/bin/sh\n"), "{s}");
         assert!(s.contains(HOOK_MARKER), "{s}");
-        assert!(s.contains("/home/u/.cargo/bin/rift"), "{s}");
+        assert!(s.contains("'/home/u/.cargo/bin/rift'"), "{s}");
         assert!(s.contains("--staged --overview --fail-on critical"), "{s}");
+        // Only a gate trip blocks; tool failures warn through.
+        assert!(s.contains("status -eq 2"), "{s}");
+        assert!(s.contains("committing anyway"), "{s}");
+    }
+
+    #[test]
+    fn shell_quote_escapes_single_quotes() {
+        assert_eq!(shell_quote("/a b/c"), "'/a b/c'");
+        assert_eq!(shell_quote("/a'b"), "'/a'\\''b'");
+        assert_eq!(shell_quote("$HOME/x"), "'$HOME/x'");
+    }
+
+    #[test]
+    fn split_positionals_reinterprets_revisions() {
+        // Documented forms from inside a repo (`.` exists everywhere).
+        assert_eq!(
+            split_positionals("main..HEAD", "", ""),
+            (".".into(), "main..HEAD".into(), "".into())
+        );
+        assert_eq!(
+            split_positionals("abc123", "", ""),
+            (".".into(), "abc123".into(), "".into())
+        );
+        assert_eq!(
+            split_positionals("main", "HEAD", ""),
+            (".".into(), "main".into(), "HEAD".into())
+        );
+        // Real paths stay paths.
+        assert_eq!(
+            split_positionals(".", "main..HEAD", ""),
+            (".".into(), "main..HEAD".into(), "".into())
+        );
+        assert_eq!(
+            split_positionals(".", "", ""),
+            (".".into(), "".into(), "".into())
+        );
+        // Path-looking input keeps the friendly not-a-repo error path.
+        assert_eq!(
+            split_positionals("/tmp/definitely-not-here", "", ""),
+            ("/tmp/definitely-not-here".into(), "".into(), "".into())
+        );
     }
 
     #[test]
@@ -711,7 +827,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            assert_eq!(std::fs::metadata(&dest).expect("meta").permissions().mode() & 0o111, 0o111);
+            assert_eq!(
+                std::fs::metadata(&dest).expect("meta").permissions().mode() & 0o111,
+                0o111
+            );
         }
         // Reinstall over our own hook is idempotent.
         install_hook(&test_args(dir.path().to_path_buf())).expect("reinstall");

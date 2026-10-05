@@ -83,8 +83,7 @@ fn build_changeset() -> ChangeSet {
     let mut files = engine.range_changeset("HEAD~1", "HEAD").expect("range");
     assert_eq!(files.len(), 2, "fixture should touch 2 files");
 
-    let (syms, items) =
-        rift_analysis::analyze("<ROOT>", "HEAD~1", "HEAD", &mut files);
+    let (syms, items) = rift_analysis::analyze("<ROOT>", "HEAD~1", "HEAD", &mut files);
     let mut cs = ChangeSet {
         repo_root: "<ROOT>".to_string(),
         base_ref: "HEAD~1".into(),
@@ -98,7 +97,8 @@ fn build_changeset() -> ChangeSet {
     rift_analysis::fill_stats(&mut cs);
 
     // Deterministic ordering for stable JSON.
-    cs.files.sort_by(|a, b| a.display_path().cmp(b.display_path()));
+    cs.files
+        .sort_by(|a, b| a.display_path().cmp(b.display_path()));
     cs.symbol_changes
         .sort_by(|a, b| (&a.file, &a.name).cmp(&(&b.file, &b.name)));
     cs.review_items.sort_by(|a, b| a.id.cmp(&b.id));
@@ -128,8 +128,12 @@ fn golden_agent_patch() {
         return;
     }
 
-    let expected =
-        std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("missing snapshot {}; bless with UPDATE_SNAPSHOTS=1", path.display()));
+    let expected = std::fs::read_to_string(&path).unwrap_or_else(|_| {
+        panic!(
+            "missing snapshot {}; bless with UPDATE_SNAPSHOTS=1",
+            path.display()
+        )
+    });
     assert_eq!(
         json.trim(),
         expected.trim(),

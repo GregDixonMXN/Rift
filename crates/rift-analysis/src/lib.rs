@@ -79,6 +79,17 @@ pub fn file_symbols(f: &FileChange) -> Vec<SymbolChange> {
     file_symbols_cached(f, &mut SymbolCache::new())
 }
 
+/// Direct-parse guard for the move/coverage/blast passes: generated and
+/// binary files never produced symbols, and oversize contents pay a slow
+/// parse for nothing (same cap as `file_symbols_cached`; untracked files
+/// may carry up to 4× the normal content budget).
+fn skip_parse(f: &FileChange) -> bool {
+    f.is_binary
+        || f.is_generated
+        || f.old_content.as_ref().map(|c| c.len()).unwrap_or(0) > rift_parser::MAX_PARSE_BYTES
+        || f.new_content.as_ref().map(|c| c.len()).unwrap_or(0) > rift_parser::MAX_PARSE_BYTES
+}
+
 /// Cached variant: shares parses across old/new sides and repeat calls.
 pub fn file_symbols_cached(f: &FileChange, cache: &mut SymbolCache) -> Vec<SymbolChange> {
     if f.is_binary || f.is_generated {
@@ -86,10 +97,7 @@ pub fn file_symbols_cached(f: &FileChange, cache: &mut SymbolCache) -> Vec<Symbo
     }
     // Parsing is capped like content loading: oversize files keep line
     // stats and whole-file entries, never a multi-second parse.
-    const MAX_PARSE_BYTES: usize = 512 * 1024;
-    if f.old_content.as_ref().map(|c| c.len()).unwrap_or(0) > MAX_PARSE_BYTES
-        || f.new_content.as_ref().map(|c| c.len()).unwrap_or(0) > MAX_PARSE_BYTES
-    {
+    if skip_parse(f) {
         return Vec::new();
     }
     let path = f.display_path();
@@ -412,10 +420,10 @@ pub fn link_moves_with_cache(
     // (insertions/deletions already explain order shifts) but the sequence
     // differs — then displaced symbols genuinely moved.
     for f in files {
-        // Generated files never produced symbols in the first place;
-        // re-parsing them here only buys noise (and minified bundles are
-        // the slowest parses in the tree).
-        if f.is_generated {
+        // Files that never produced symbols (generated, binary, oversize)
+        // are skipped: re-parsing them here only buys noise, and minified
+        // bundles are the slowest parses in the tree.
+        if skip_parse(f) {
             continue;
         }
         let path = f.display_path();
@@ -520,7 +528,9 @@ fn link_exact_pair(r: &SymbolChange, a: &SymbolChange) -> SymbolChange {
         },
         kind: a.kind,
         change: SymbolChangeKind::Moved,
-        confidence: 0.95,
+        // A rename inside the move is an edit, not a pure relocation:
+        // lower confidence keeps it out of the Low "pure move" bucket.
+        confidence: if renamed { 0.70 } else { 0.95 },
         old_signature: r.old_signature.clone(),
         new_signature: a.new_signature.clone(),
         old_lines: r.old_lines,
@@ -678,6 +688,12 @@ pub fn apply_test_coverage(
     apply_test_coverage_with_cache(files, syms, items, ctx, &mut SymbolCache::new())
 }
 
+/// Owner qualification stripped: `Auth::login` → `login`.
+/// Call sites and import edges name the short form.
+fn short_name(name: &str) -> &str {
+    name.rsplit("::").next().unwrap_or(name)
+}
+
 /// Cached variant: changed-file test scans hit the shared cache.
 pub fn apply_test_coverage_with_cache(
     files: &[FileChange],
@@ -688,8 +704,9 @@ pub fn apply_test_coverage_with_cache(
 ) {
     let mut tests: Vec<TestInfo> = Vec::new();
     for f in files {
-        // Generated files contribute no test signal; parsing them here
-        // re-pays the slowest parses (minified bundles) for nothing.
+        // Test bodies are scanned for call sites directly (not via the
+        // symbol table), so oversize files still contribute recall here;
+        // only binary/generated files are skipped outright.
         if f.is_binary || f.is_generated {
             continue;
         }
@@ -722,38 +739,58 @@ pub fn apply_test_coverage_with_cache(
         .collect();
 
     // (file, symbol) -> covering "name (file)" labels.
+    // Symbols carry owner qualification (`Auth::login`) but call sites
+    // name the short form (`login`), so matching tries both. Short-name
+    // matches can over-attribute across same-named methods; that is the
+    // documented price of recall here (evidence, not proof).
     let mut covering: HashMap<(String, String), Vec<String>> = HashMap::new();
     for s in syms {
         if matches!(s.kind, SymbolKind::Module) {
             continue;
         }
+        // Renames read "old → new": coverage follows the new name.
+        let name = s.name.rsplit(" → ").next().unwrap_or(&s.name);
+        let short = short_name(name);
         if test_file.get(s.file.as_str()).copied().unwrap_or(false)
-            || test_names.iter().any(|t| *t == s.name)
+            || test_names.iter().any(|t| *t == name || *t == short)
         {
             continue; // the change itself is a test
         }
         let mut cov: Vec<String> = tests
             .iter()
-            .filter(|t| t.calls.iter().any(|c| c == &s.name) || test_targets(&t.name, &s.name))
+            .filter(|t| {
+                t.calls.iter().any(|c| c == name || c == short)
+                    || test_targets(&t.name, name)
+                    || test_targets(&t.name, short)
+            })
             .map(|t| format!("{} ({})", t.name, t.file))
             .collect();
         cov.sort();
         cov.dedup();
         if !cov.is_empty() {
-            covering.insert((s.file.clone(), s.name.clone()), cov);
+            covering.insert((s.file.clone(), name.to_string()), cov);
         }
     }
 
-    for item in items.iter_mut().filter(|i| i.id.starts_with("file:")) {
-        let Some(path) = item.files.first() else {
+    // Move items (`move:from→to`) carry symbols too: an edited move with
+    // no covering tests deserves the same flag as an edited file. Pure
+    // moves are Refactor, so the `untested-change` gate below ignores them.
+    for item in items
+        .iter_mut()
+        .filter(|i| i.id.starts_with("file:") || i.id.starts_with("move:"))
+    {
+        let paths = item.files.clone();
+        let Some(path) = paths.first() else {
             continue;
         };
         let mut cov: Vec<String> = Vec::new();
         for sym_name in &item.symbols {
             // Renames read "old → new": coverage follows the new name.
             let name = sym_name.rsplit(" → ").next().unwrap_or(sym_name);
-            if let Some(c) = covering.get(&(path.clone(), name.to_string())) {
-                cov.extend(c.iter().cloned());
+            for p in &paths {
+                if let Some(c) = covering.get(&(p.clone(), name.to_string())) {
+                    cov.extend(c.iter().cloned());
+                }
             }
         }
         cov.sort();
@@ -821,13 +858,19 @@ pub fn apply_blast_radius_with_cache(
             continue;
         }
         let path = f.display_path();
-        let Some(content) = f.new_content.as_deref() else {
-            continue;
-        };
-        for s in extract_cached(path, f.language, content, cache) {
-            defn.entry(s.name.clone())
-                .or_default()
-                .push(path.to_string());
+        // Both sides: a deleted symbol is defined only by old content —
+        // without it, callers of removed code never resolve. (Cache hits
+        // make the second parse cheap: contents were parsed for symbols
+        // already.) Same-file duplicates collapse in the sort+dedup below.
+        for content in [f.new_content.as_deref(), f.old_content.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            for s in extract_cached(path, f.language, content, cache) {
+                defn.entry(s.name.clone())
+                    .or_default()
+                    .push(path.to_string());
+            }
         }
     }
     for v in defn.values_mut() {
@@ -838,26 +881,31 @@ pub fn apply_blast_radius_with_cache(
     let test_names: std::collections::HashSet<&str> =
         ctx.tests.iter().map(|t| t.name.as_str()).collect();
 
-    for item in items.iter_mut().filter(|i| i.id.starts_with("file:")) {
-        let Some(path) = item.files.first().cloned() else {
+    for item in items
+        .iter_mut()
+        .filter(|i| i.id.starts_with("file:") || i.id.starts_with("move:"))
+    {
+        let paths = item.files.clone();
+        let Some(path) = paths.first().cloned() else {
             continue;
         };
         let mut affected: Vec<String> = Vec::new();
         for sym_name in &item.symbols {
             // Renames read "old → new": dependents follow the new name.
             let name = sym_name.rsplit(" → ").next().unwrap_or(sym_name);
+            let short = short_name(name);
             if test_names.contains(name) {
                 continue;
             }
             let unique = defn.get(name).map(|v| v.len() == 1).unwrap_or(false);
             for src in &ctx.sources {
-                if src.path == path || rift_git::is_test_path(&src.path) {
+                if paths.contains(&src.path) || rift_git::is_test_path(&src.path) {
                     continue;
                 }
-                if !src.calls.iter().any(|c| c == name) {
+                if !src.calls.iter().any(|c| c == name || c == short) {
                     continue;
                 }
-                if src.imports.iter().any(|i| i == name) || unique {
+                if src.imports.iter().any(|i| i == name || i == short) || unique {
                     affected.push(src.path.clone());
                 }
             }
@@ -968,19 +1016,21 @@ fn generated_by_name(path: &str) -> bool {
 }
 
 fn generated_by_content(f: &FileChange) -> bool {
-    let src = f.old_content.as_deref().or(f.new_content.as_deref());
-    let Some(c) = src else {
-        return false;
-    };
-    // Check first 5 lines only — cheap.
-    for line in c.lines().take(5) {
-        let ll = line.to_lowercase();
-        if ll.contains("auto-generated")
-            || ll.contains("autogenerated")
-            || ll.contains("@generated")
-            || (ll.contains("do not edit") && ll.contains("generat"))
-        {
-            return true;
+    // Either side: a file that *becomes* generated is mechanical too.
+    for src in [f.old_content.as_deref(), f.new_content.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        // Check first 5 lines only — cheap.
+        for line in src.lines().take(5) {
+            let ll = line.to_lowercase();
+            if ll.contains("auto-generated")
+                || ll.contains("autogenerated")
+                || ll.contains("@generated")
+                || (ll.contains("do not edit") && ll.contains("generat"))
+            {
+                return true;
+            }
         }
     }
     false
@@ -997,6 +1047,7 @@ pub fn mark_generated(files: &mut [FileChange]) {
 // Importance scoring
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
 struct Score {
     priority: u8,
     severity: Severity,
@@ -1039,7 +1090,18 @@ fn score_file(f: &FileChange, syms: &[&SymbolChange]) -> Score {
         };
     }
 
-    // Auth / security surface.
+    // Auth / security surface. Whole-segment matching: `author.rs` is
+    // not auth surface, but `auth.rs`, `session.rs`, `user-auth.rs` are.
+    // (Hyphenated compounds like `sign-in` still substring-match since
+    // segments split on `-`.)
+    let segments: Vec<&str> = path.split(['/', '.', '_', '-']).collect();
+    let seg_has = |kw: &str| {
+        if kw.contains('-') || kw.contains('/') {
+            path.contains(kw)
+        } else {
+            segments.contains(&kw)
+        }
+    };
     let auth_hit = [
         "auth",
         "session",
@@ -1054,7 +1116,7 @@ fn score_file(f: &FileChange, syms: &[&SymbolChange]) -> Score {
         "sign-in",
     ]
     .iter()
-    .any(|k| path.contains(k));
+    .any(|k| seg_has(k));
     if auth_hit {
         points += 45;
         severity = severity.max(Severity::High);
@@ -1112,11 +1174,12 @@ fn score_file(f: &FileChange, syms: &[&SymbolChange]) -> Score {
         );
     }
     // Test files: informative but low priority (unless existing tests modified).
+    // Test/docs win over path-keyword categories: `tests/auth_test.rs`
+    // is a test change that happens to touch auth words, not an auth
+    // change. Severity/evidence from keyword hits are kept.
     if f.is_test_file {
         points -= 10;
-        if category == Category::Unknown {
-            category = Category::Test;
-        }
+        category = Category::Test;
         ev(
             "test-file",
             "test file — verifies behavior, rarely the risk itself",
@@ -1125,9 +1188,7 @@ fn score_file(f: &FileChange, syms: &[&SymbolChange]) -> Score {
     // Docs-only.
     if path.ends_with(".md") || path.ends_with(".rst") || path.contains("/docs/") {
         points -= 12;
-        if category == Category::Unknown {
-            category = Category::Docs;
-        }
+        category = Category::Docs;
         ev("docs", "documentation change");
     }
     // Symbol-level signals. Per-symbol bonuses are capped in aggregate so a
@@ -1157,6 +1218,9 @@ fn score_file(f: &FileChange, syms: &[&SymbolChange]) -> Score {
             SymbolChangeKind::VisibilityChanged => {
                 symbol_bonus += 20;
                 severity = severity.max(Severity::Medium);
+                if category == Category::Unknown {
+                    category = Category::ApiBreak;
+                }
                 ev(
                     "visibility-changed",
                     &format!("visibility changed: {}", s.name),
@@ -1184,25 +1248,22 @@ fn score_file(f: &FileChange, syms: &[&SymbolChange]) -> Score {
         }
     }
     points += symbol_bonus.clamp(0, 25);
-    // Content signals on added lines.
-    let added_text: String = f
-        .hunks
-        .iter()
-        .flat_map(|h| h.lines.iter())
-        .filter(|l| matches!(l.kind, rift_core::DiffLineKind::Addition))
-        .map(|l| l.text.clone())
-        .collect::<Vec<_>>()
-        .join("\n")
-        .to_lowercase();
-    let deleted_text: String = f
-        .hunks
-        .iter()
-        .flat_map(|h| h.lines.iter())
-        .filter(|l| matches!(l.kind, rift_core::DiffLineKind::Deletion))
-        .map(|l| l.text.clone())
-        .collect::<Vec<_>>()
-        .join("\n")
-        .to_lowercase();
+    // Content signals on added/deleted lines, with string literals and
+    // line comments stripped: mentioning `valid` in a comment is not
+    // validation logic (same hygiene as the `unsafe` check below).
+    // NOTE: `==`, not `matches!` — a variable in a `matches!` pattern
+    // binds instead of comparing and would mix additions into deletions.
+    let code_text = |kind: rift_core::DiffLineKind| {
+        f.hunks
+            .iter()
+            .flat_map(|h| h.lines.iter())
+            .filter(|l| l.kind == kind)
+            .map(|l| strip_string_literals(&l.text).to_lowercase())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let added_text = code_text(rift_core::DiffLineKind::Addition);
+    let deleted_text = code_text(rift_core::DiffLineKind::Deletion);
     let has_unsafe = f
         .hunks
         .iter()
@@ -1220,6 +1281,9 @@ fn score_file(f: &FileChange, syms: &[&SymbolChange]) -> Score {
     if has_unsafe && f.language == rift_core::Language::Rust {
         points += 20;
         severity = severity.max(Severity::High);
+        if category == Category::Unknown {
+            category = Category::Security;
+        }
         ev("unsafe", "new `unsafe` code");
     }
     if deleted_text.contains("valid") && !added_text.contains("valid") {
@@ -1239,7 +1303,9 @@ fn score_file(f: &FileChange, syms: &[&SymbolChange]) -> Score {
         points += 10;
         ev("conditional-changed", "branch conditions modified");
     }
-    if (path.contains("secret") || path.contains("credential") || path.contains("key"))
+    // Whole-segment path match: `keyboard.rs` and `monkey.rs` are not
+    // secret handling (`key` as a substring over-matches).
+    if (seg_has("secret") || seg_has("credential") || seg_has("key"))
         && (added_text.contains("secret")
             || added_text.contains("token")
             || added_text.contains("password"))
@@ -1330,15 +1396,20 @@ pub fn group_items(files: &[FileChange], syms: &[SymbolChange]) -> Vec<ReviewIte
         })
         .collect();
     // Only bucket additive test changes; removed/broken tests get per-file items.
+    // Files with zero symbol changes are excluded: `all()` is vacuously
+    // true on the empty set, which previously bucketed empty/unparseable
+    // test files as "0 added".
     let pure_test_adds: Vec<&FileChange> = test_added
         .iter()
         .filter(|f| {
+            let mut has_any = false;
             syms.iter().filter(|s| s.file == f.display_path()).all(|s| {
+                has_any = true;
                 matches!(
                     s.change,
                     SymbolChangeKind::Added | SymbolChangeKind::Modified
                 )
-            })
+            }) && has_any
         })
         .copied()
         .collect();
@@ -1682,6 +1753,104 @@ mod tests {
         assert_eq!(s.category, Category::Auth);
     }
 
+    #[test]
+    fn author_is_not_auth_but_auth_paths_are() {
+        let auth = score_file(&fc("src/auth/session.rs", "x", "y"), &[]);
+        assert_eq!(auth.category, Category::Auth);
+        // `author` merely contains the substring.
+        let author = score_file(&fc("src/author.rs", "x", "y"), &[]);
+        assert_ne!(author.category, Category::Auth, "{author:?}");
+        // Test and docs files keep their own lens even on auth words.
+        let mut test_fc = fc("tests/auth_test.rs", "x", "y");
+        test_fc.is_test_file = true;
+        let t = score_file(&test_fc, &[]);
+        assert_eq!(t.category, Category::Test, "{t:?}");
+        assert_eq!(t.severity, Severity::High, "severity evidence kept: {t:?}");
+        let docs = score_file(&fc("docs/auth.md", "x", "y"), &[]);
+        assert_eq!(docs.category, Category::Docs, "{docs:?}");
+    }
+
+    #[test]
+    fn keyboard_is_not_secret_handling() {
+        let f = fc("src/keyboard.rs", "let token = 1;", "let token = 0;");
+        let s = score_file(&f, &[]);
+        assert_ne!(s.category, Category::Security, "{s:?}");
+        let f = fc("src/api_key.rs", "let token = 1;", "let token = 0;");
+        let s = score_file(&f, &[]);
+        assert_eq!(s.category, Category::Security, "{s:?}");
+    }
+
+    #[test]
+    fn comment_mentions_are_not_content_signals() {
+        // `// validate` in a deleted comment is not removed validation.
+        let f = fc("src/a.rs", "ok();", "// validate input");
+        let s = score_file(&f, &[]);
+        assert!(
+            !s.reasons.iter().any(|e| e.kind == "validation-removed"),
+            "{s:?}"
+        );
+    }
+
+    #[test]
+    fn unsafe_and_visibility_get_security_api_categories() {
+        let f = fc("src/a.rs", "unsafe { f(); }", "f();");
+        let s = score_file(&f, &[]);
+        assert_eq!(s.category, Category::Security, "{s:?}");
+        let vis = SymbolChange {
+            file: "src/a.rs".into(),
+            name: "f".into(),
+            kind: SymbolKind::Function,
+            change: SymbolChangeKind::VisibilityChanged,
+            confidence: 0.95,
+            old_signature: None,
+            new_signature: None,
+            old_lines: None,
+            new_lines: None,
+            evidence: vec![],
+        };
+        let s = score_file(&fc("src/a.rs", "x", "y"), &[&vis]);
+        assert_eq!(s.category, Category::ApiBreak, "{s:?}");
+    }
+
+    #[test]
+    fn method_coverage_matches_short_call_names() {
+        // `Auth::login` changed; a test calling `login()` must cover it.
+        let syms = vec![SymbolChange {
+            file: "src/auth.rs".into(),
+            name: "Auth::login".into(),
+            kind: SymbolKind::Method,
+            change: SymbolChangeKind::Modified,
+            confidence: 0.9,
+            old_signature: None,
+            new_signature: None,
+            old_lines: None,
+            new_lines: None,
+            evidence: vec![],
+        }];
+        let mut test_fc = fc("tests/auth_test.rs", "+", "-");
+        test_fc.is_test_file = true;
+        test_fc.new_content = Some("fn test_login() {\n    login(user);\n}\n".into());
+        let files = vec![
+            {
+                let mut f = fc("src/auth.rs", "+", "-");
+                f.new_content = Some("class Auth:\n    def login(self):\n        pass\n".into());
+                f
+            },
+            test_fc,
+        ];
+        let ctx = collect_context("", &files);
+        let mut items = group_items(&files, &syms);
+        apply_test_coverage(&files, &syms, &mut items, &ctx);
+        let item = items
+            .iter()
+            .find(|i| i.id.starts_with("file:"))
+            .expect("item");
+        assert!(
+            item.evidence.iter().any(|e| e.kind == "covering-tests"),
+            "method covered by short-name call: {item:?}"
+        );
+    }
+
     /// The UI worker's sequential recipe must match batch analyze() exactly:
     /// same flags, same symbols, same items, same stats.
     #[test]
@@ -2002,6 +2171,41 @@ mod tests {
             .iter()
             .find(|e| e.kind == "blast-radius")
             .expect("blast evidence");
+        assert!(ev.summary.contains("src/routes.rs"), "{}", ev.summary);
+    }
+
+    #[test]
+    fn blast_radius_finds_callers_of_deleted_symbols() {
+        // login is removed: only old content defines it, but the
+        // unchanged caller with an import edge must still resolve.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/routes.rs"),
+            "use crate::auth::login;\n\npub fn handle() {\n    login(\"x\");\n}\n",
+        )
+        .unwrap();
+        let mut files = vec![moved_fc(
+            "src/auth.rs",
+            Some("pub fn login(user: &str) -> bool {\n    false\n}\n"),
+            Some("pub fn other() {}\n"),
+        )];
+        mark_generated(&mut files);
+        let syms: Vec<SymbolChange> = files.iter().flat_map(file_symbols).collect();
+        assert!(syms.iter().any(|s| s.name == "login"), "{syms:?}");
+        let syms = link_moves(&files, syms);
+        let mut items = group_items(&files, &syms);
+        let ctx = collect_context(dir.path().to_str().unwrap(), &files);
+        apply_blast_radius(&files, &mut items, &ctx);
+        let item = items
+            .iter()
+            .find(|i| i.id == "file:src/auth.rs")
+            .expect("auth item");
+        let ev = item
+            .evidence
+            .iter()
+            .find(|e| e.kind == "blast-radius")
+            .expect("blast evidence for deleted login: {item:?}");
         assert!(ev.summary.contains("src/routes.rs"), "{}", ev.summary);
     }
 

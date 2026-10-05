@@ -24,6 +24,12 @@ impl GitEngine {
         Ok(Self { repo, root })
     }
 
+    /// The git dir (`.git/`): hook and config home. For bare repos this
+    /// *is* the root; for normal repos it hangs off the workdir root.
+    pub fn git_dir(&self) -> PathBuf {
+        self.repo.path().to_path_buf()
+    }
+
     pub fn head_short(&self) -> String {
         self.repo
             .head()
@@ -288,15 +294,19 @@ fn diff_to_files(diff: &mut git2::Diff) -> Result<Vec<FileChange>> {
     }
     let mut di = 0usize;
     diff.foreach(
-        &mut |_delta, _| {
+        &mut |delta, _| {
             if di < delta_infos.len() {
                 let (ref of, ref nf, st) = delta_infos[di];
                 flush_pending(&mut cur.borrow_mut(), &mut ordered.borrow_mut());
+                // Trust the delta flags, not just `B` line markers: a
+                // binary file may yield no line callbacks at all, which
+                // previously recorded it as text with zero hunks.
+                let binary = delta.flags().contains(git2::DiffFlags::BINARY);
                 *cur.borrow_mut() = Some(Pending {
                     old_path: of.clone(),
                     new_path: nf.clone(),
                     status: st,
-                    is_binary: false,
+                    is_binary: binary,
                     hunks: vec![],
                     added: 0,
                     deleted: 0,
@@ -372,7 +382,7 @@ fn diff_to_files(diff: &mut git2::Diff) -> Result<Vec<FileChange>> {
             true
         }),
     )
-    .ok();
+    .context("iterating diff content")?;
     flush_pending(&mut cur.borrow_mut(), &mut ordered.borrow_mut());
     // Fallback: if foreach produced nothing but deltas exist (binary-only),
     // keep delta shells.
@@ -427,7 +437,11 @@ fn fill_worktree_contents(repo: &Repository, root: &Path, fc: &mut FileChange) {
         let abs = root.join(&fc.new_path);
         if let Ok(m) = std::fs::metadata(&abs) {
             if m.len() <= MAX_CONTENT_BYTES {
-                fc.new_content = std::fs::read_to_string(&abs).ok();
+                match std::fs::read(&abs) {
+                    Ok(bytes) if bytes.contains(&0) => fc.is_binary = true,
+                    Ok(bytes) => fc.new_content = String::from_utf8(bytes).ok(),
+                    Err(_) => {}
+                }
             }
         }
     }
@@ -498,16 +512,88 @@ fn fill_tree_contents(
 
 pub fn is_test_path(p: &str) -> bool {
     let l = p.to_lowercase();
-    l.contains("/test")
-        || l.contains("/tests/")
-        || l.contains("test_")
-        || l.ends_with("_test.rs")
-        || l.ends_with("_test.ts")
-        || l.ends_with("_test.py")
-        || l.ends_with(".test.ts")
-        || l.ends_with(".test.js")
-        || l.ends_with(".spec.ts")
-        || l.ends_with(".spec.js")
-        || l.starts_with("test/")
-        || l.starts_with("tests/")
+    // Whole-segment matching: `/test` as a substring also fires on
+    // `/testing/`, `/testdata/`, and `contest_foo`.
+    let segs: Vec<&str> = l.split('/').collect();
+    if segs.iter().any(|s| *s == "test" || *s == "tests") {
+        return true;
+    }
+    let file = segs.last().copied().unwrap_or("");
+    // `foo_test.rs`, `foo.test.ts`, `foo.spec.js`, `test_foo.*`.
+    file.starts_with("test_")
+        || file.starts_with("test-")
+        || file.contains("_test.")
+        || file.contains(".test.")
+        || file.contains(".spec.")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_paths_match_test_conventions() {
+        for p in [
+            "tests/auth_test.rs",
+            "test/foo.rs",
+            "tests/unit/x.py",
+            "src/auth_test.rs",
+            "src/foo.test.ts",
+            "src/foo.spec.js",
+            "test_foo.py",
+            "test-foo.rs",
+        ] {
+            assert!(is_test_path(p), "{p}");
+        }
+    }
+
+    #[test]
+    fn test_paths_reject_lookalikes() {
+        for p in [
+            "src/testing/util.rs",
+            "testdata/fixture.json",
+            "src/contest_results.rs",
+            "src/latest_news.rs",
+            "src/mytest/file.rs",
+            "src/protest.rs",
+        ] {
+            assert!(!is_test_path(p), "{p}");
+        }
+    }
+
+    fn commit_all(repo: &git2::Repository, msg: &str) {
+        let mut idx = repo.index().unwrap();
+        idx.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        idx.write().unwrap();
+        let tree = idx.write_tree().unwrap();
+        let tree = repo.find_tree(tree).unwrap();
+        let sig = repo.signature().unwrap();
+        let head = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+        let parents: Vec<&git2::Commit> = head.iter().collect();
+        repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, &parents)
+            .unwrap();
+    }
+
+    #[test]
+    fn binary_file_flagged_binary_alongside_text() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
+        // NUL byte: unmistakably binary.
+        std::fs::write(dir.path().join("b.bin"), [0x89, b'P', b'N', b'G', 0, 1, 2]).unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        {
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.name", "t").unwrap();
+            cfg.set_str("user.email", "t@t").unwrap();
+        }
+        commit_all(&repo, "init");
+        std::fs::write(dir.path().join("a.txt"), "hello world\n").unwrap();
+        std::fs::write(dir.path().join("b.bin"), [0x89, b'P', b'N', b'G', 0, 9, 9]).unwrap();
+        let engine = GitEngine::discover(dir.path()).unwrap();
+        let files = engine.worktree_changeset(true).unwrap();
+        let bin = files.iter().find(|f| f.new_path == "b.bin").expect("b.bin");
+        assert!(bin.is_binary, "binary stays binary: {bin:?}");
+        assert!(files.iter().any(|f| f.new_path == "a.txt"), "{files:?}");
+    }
 }

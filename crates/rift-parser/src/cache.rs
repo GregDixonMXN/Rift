@@ -169,14 +169,15 @@ impl SymbolCache {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let entries: HashMap<&String, &Vec<Symbol>> =
-            self.map.iter().collect();
+        let entries: HashMap<&String, &Vec<Symbol>> = self.map.iter().collect();
         let value = serde_json::json!({
             "version": CACHE_VERSION,
             "entries": entries,
         });
-        let bytes = serde_json::to_vec_pretty(&value)
-            .map_err(std::io::Error::other)?;
+        // Compact, not pretty: the cache is machine state rewritten every
+        // run (up to 5000 entries) — whitespace is pure write/read cost.
+        // Loading accepts either shape, so old pretty files still parse.
+        let bytes = serde_json::to_vec(&value).map_err(std::io::Error::other)?;
         // Write atomically: temp file + rename so a killed run never
         // leaves a truncated cache behind.
         let tmp = path.with_extension("tmp");
@@ -217,10 +218,13 @@ mod tests {
     #[test]
     fn extract_hits_rewrite_path() {
         let mut cache = SymbolCache::new();
-        let first = cache.extract("a.rs", Language::Rust, "fn f() {}", || vec![sym("f", "a.rs")]);
+        let first = cache.extract("a.rs", Language::Rust, "fn f() {}", || {
+            vec![sym("f", "a.rs")]
+        });
         assert_eq!(cache.misses, 1);
-        let second =
-            cache.extract("copy.rs", Language::Rust, "fn f() {}", || panic!("must hit"));
+        let second = cache.extract("copy.rs", Language::Rust, "fn f() {}", || {
+            panic!("must hit")
+        });
         assert_eq!(cache.hits, 1);
         assert_eq!(first.len(), second.len());
         assert!(second.iter().all(|s| s.file == "copy.rs"));

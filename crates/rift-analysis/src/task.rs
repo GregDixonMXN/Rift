@@ -6,10 +6,8 @@
 //! evidence summaries, added-line tokens), and report coverage with
 //! per-item attribution. No LLM, no network, no randomness.
 
-use rift_core::{
-    ChangeSet, ReviewItem, TaskCheck, TaskItemHit, TaskTermMatch, TaskVerdict,
-};
-use std::collections::HashSet;
+use rift_core::{ChangeSet, ReviewItem, TaskCheck, TaskItemHit, TaskTermMatch, TaskVerdict};
+use std::collections::{HashMap, HashSet};
 
 /// Minimum bigram similarity for a fuzzy term match.
 const FUZZY_THRESHOLD: f32 = 0.6;
@@ -20,12 +18,63 @@ const MAX_HITS: usize = 5;
 /// ("the", "and", "should", ...) are dropped before matching so a
 /// well-written task sentence degrades to its content words.
 const STOPWORDS: &[&str] = &[
-    "a", "an", "the", "and", "or", "but", "of", "to", "in", "on", "for", "with", "by", "at",
-    "from", "as", "is", "are", "was", "were", "be", "been", "it", "its", "this", "that",
-    "these", "those", "should", "would", "could", "must", "need", "needs", "add", "adds",
-    "added", "adding", "fix", "fixes", "fixed", "fixing", "update", "updates", "updated",
-    "updating", "make", "makes", "use", "uses", "used", "using", "new", "also", "just",
-    "please", "implement",
+    "a",
+    "an",
+    "the",
+    "and",
+    "or",
+    "but",
+    "of",
+    "to",
+    "in",
+    "on",
+    "for",
+    "with",
+    "by",
+    "at",
+    "from",
+    "as",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "it",
+    "its",
+    "this",
+    "that",
+    "these",
+    "those",
+    "should",
+    "would",
+    "could",
+    "must",
+    "need",
+    "needs",
+    "add",
+    "adds",
+    "added",
+    "adding",
+    "fix",
+    "fixes",
+    "fixed",
+    "fixing",
+    "update",
+    "updates",
+    "updated",
+    "updating",
+    "make",
+    "makes",
+    "use",
+    "uses",
+    "used",
+    "using",
+    "new",
+    "also",
+    "just",
+    "please",
+    "implement",
 ];
 
 /// Split one identifier into lowercase word parts:
@@ -42,23 +91,27 @@ pub fn split_ident(s: &str) -> Vec<String> {
             cur.clear();
         }
     };
-    let chars: Vec<char> = s.chars().collect();
-    for (i, &c) in chars.iter().enumerate() {
+    // Peekable chars instead of a collected Vec: same boundaries (a
+    // separator resets `prev`, which can never satisfy either boundary
+    // condition anyway), no per-string allocation.
+    let mut prev: Option<char> = None;
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
         if c.is_alphanumeric() {
-            let prev_lower_next_upper = i > 0
-                && chars[i - 1].is_lowercase()
-                && c.is_uppercase();
-            let acronym_boundary = i > 0
-                && i + 1 < chars.len()
-                && chars[i - 1].is_uppercase()
+            let next = it.peek().copied();
+            let prev_lower_next_upper =
+                matches!(prev, Some(p) if p.is_lowercase()) && c.is_uppercase();
+            let acronym_boundary = matches!(prev, Some(p) if p.is_uppercase())
                 && c.is_uppercase()
-                && chars[i + 1].is_lowercase();
+                && matches!(next, Some(n) if n.is_lowercase());
             if prev_lower_next_upper || acronym_boundary {
                 flush(&mut cur, &mut parts);
             }
             cur.push(c);
+            prev = Some(c);
         } else {
             flush(&mut cur, &mut parts);
+            prev = None;
         }
     }
     flush(&mut cur, &mut parts);
@@ -70,8 +123,8 @@ pub fn task_terms(text: &str) -> Vec<String> {
     let stop: HashSet<&str> = STOPWORDS.iter().copied().collect();
     let mut seen = HashSet::new();
     let mut out = Vec::new();
-    for raw in split_ident(text) {
-        let t = raw.to_lowercase();
+    // `split_ident` already lowercases; no second pass needed.
+    for t in split_ident(text) {
         if t.len() < 3 || stop.contains(t.as_str()) || !seen.insert(t.clone()) {
             continue;
         }
@@ -88,31 +141,57 @@ fn bigrams(s: &str) -> Vec<String> {
     c.windows(2).map(|w| w.iter().collect()).collect()
 }
 
-fn bigram_sim(a: &str, b: &str) -> f32 {
-    if a == b {
-        return 1.0;
-    }
-    let ab = bigrams(a);
-    let bb = bigrams(b);
-    if ab.is_empty() || bb.is_empty() {
-        return 0.0;
-    }
-    let mut rest = bb.clone();
-    let mut hits = 0;
-    for g in &ab {
-        if let Some(i) = rest.iter().position(|x| x == g) {
-            hits += 1;
-            rest.remove(i);
-        }
-    }
-    2.0 * hits as f32 / (ab.len() + bb.len()) as f32
+/// Bigram multiset with its source length, computed once per unique
+/// string and reused across every term × token comparison.
+#[derive(Clone)]
+struct Bigrams {
+    chars: usize,
+    grams: Vec<String>,
 }
 
-/// One corpus entry: the normalized token plus a human-readable
-/// `matched_via` label pointing at where it came from.
+fn bigrams_of(s: &str) -> Bigrams {
+    Bigrams {
+        chars: s.chars().count(),
+        grams: bigrams(s),
+    }
+}
+
+/// Exact integer bound: Dice = 2·hits/(A+B) ≤ 2·min(A,B)/(A+B), so when
+/// that ceiling sits below the fuzzy threshold the pair cannot match and
+/// the bigram work is skipped. No floats, no rounding drift — pairs that
+/// could reach 0.6 always run the full comparison.
+fn dice_possible(a_chars: usize, b_chars: usize) -> bool {
+    let (a, b) = (
+        a_chars.saturating_sub(1).max(1),
+        b_chars.saturating_sub(1).max(1),
+    );
+    2 * a.min(b) * 10 >= 6 * (a + b)
+}
+
+/// Multiset intersection count without cloning either side: one small
+/// `used` bitmap instead of a cloned+`remove`d vec per pair. Greedy
+/// first-unused matching counts the same multiset intersection either way.
+fn dice(a: &Bigrams, b: &Bigrams) -> f32 {
+    let mut used = vec![false; b.grams.len()];
+    let mut hits = 0;
+    for g in &a.grams {
+        for (j, x) in b.grams.iter().enumerate() {
+            if !used[j] && x == g {
+                used[j] = true;
+                hits += 1;
+                break;
+            }
+        }
+    }
+    2.0 * hits as f32 / (a.grams.len() + b.grams.len()) as f32
+}
+
+/// One corpus entry: the normalized token plus an index into the shared
+/// `vias` table. Storing the label once (not cloned per token) removes
+/// the bulk of corpus-build allocation on large diffs.
 struct CorpusToken {
     token: String,
-    via: String,
+    via: u32,
 }
 
 /// Strip `"..."` / `r"..."` literal contents and `//` comments so task
@@ -137,9 +216,7 @@ fn strip_code_literals(s: &str) -> String {
                 let hashes = j - (i + 1);
                 j += 1;
                 while j < bytes.len() {
-                    if bytes[j] == '"'
-                        && bytes[j + 1..].starts_with(&vec!['#'; hashes])
-                    {
+                    if bytes[j] == '"' && bytes[j + 1..].starts_with(&vec!['#'; hashes]) {
                         j += 1 + hashes;
                         break;
                     }
@@ -174,105 +251,260 @@ fn strip_code_literals(s: &str) -> String {
 /// symbol names, file paths, review titles/why, evidence summaries,
 /// added-diff tokens (literals/comments stripped, so prose doesn't
 /// swamp signals).
-fn build_corpus(cs: &ChangeSet) -> Vec<CorpusToken> {
+///
+/// Two build-time economies with zero result change: `via` labels live
+/// once in a shared table (not cloned per token), and repeated tokens
+/// keep only their first occurrence (matching takes the max over a term,
+/// so duplicates never change a score — only the pair count).
+fn build_corpus(cs: &ChangeSet) -> (Vec<CorpusToken>, Vec<String>) {
     let mut corpus = Vec::new();
-    let mut push_tokens = |text: &str, via: String| {
-        for t in split_ident(text) {
-            corpus.push(CorpusToken {
-                token: t,
-                via: via.clone(),
-            });
+    let mut vias: Vec<String> = Vec::new();
+    // Local fns (not closures) so `corpus` stays pushable at call sites.
+    fn via_idx(vias: &mut Vec<String>, via: &str) -> u32 {
+        match vias.iter().position(|v| v == via) {
+            Some(i) => i as u32,
+            None => {
+                vias.push(via.to_string());
+                vias.len() as u32 - 1
+            }
         }
-    };
+    }
+    fn push_token(
+        corpus: &mut Vec<CorpusToken>,
+        seen: &mut HashSet<String>,
+        token: String,
+        idx: u32,
+    ) {
+        // `contains` first: `insert` would clone the token even for
+        // duplicates, and repeats dominate large diffs.
+        if !seen.contains(token.as_str()) {
+            seen.insert(token.clone());
+            corpus.push(CorpusToken { token, via: idx });
+        }
+    }
+    fn push_tokens(
+        corpus: &mut Vec<CorpusToken>,
+        vias: &mut Vec<String>,
+        seen: &mut HashSet<String>,
+        text: &str,
+        via: &str,
+    ) {
+        let idx = via_idx(vias, via);
+        for t in split_ident(text) {
+            push_token(corpus, seen, t, idx);
+        }
+    }
+    let mut seen = HashSet::new();
     for s in &cs.symbol_changes {
         let via = format!("symbol {}", s.name);
-        push_tokens(&s.name, via);
+        push_tokens(&mut corpus, &mut vias, &mut seen, &s.name, &via);
         if let Some(sig) = s.new_signature.as_ref().or(s.old_signature.as_ref()) {
             let via = format!("symbol {}", s.name);
             // Signatures add type/param words ("timeout", "u64") cheaply.
-            push_tokens(sig, via);
+            push_tokens(&mut corpus, &mut vias, &mut seen, sig, &via);
         }
     }
     for f in &cs.files {
         let p = f.display_path();
-        push_tokens(p, format!("file {p}"));
-        for h in &f.hunks {
-            for l in &h.lines {
-                if !matches!(l.kind, rift_core::DiffLineKind::Addition) {
-                    continue;
-                }
-                // Cap per-line work: first 300 chars, literals/comments
-                // stripped so fixture strings don't fake coverage.
-                let text: String = l.text.chars().take(300).collect();
-                push_tokens(&strip_code_literals(&text), format!("diff {}", p));
-            }
+        push_tokens(&mut corpus, &mut vias, &mut seen, p, &format!("file {p}"));
+        let idx = via_idx(&mut vias, &format!("diff {}", p));
+        for t in diff_tokens(f) {
+            push_token(&mut corpus, &mut seen, t, idx);
         }
     }
     for r in &cs.review_items {
-        push_tokens(&r.title, format!("review {}", r.id));
-        push_tokens(&r.why, format!("review {}", r.id));
+        push_tokens(
+            &mut corpus,
+            &mut vias,
+            &mut seen,
+            &r.title,
+            &format!("review {}", r.id),
+        );
+        push_tokens(
+            &mut corpus,
+            &mut vias,
+            &mut seen,
+            &r.why,
+            &format!("review {}", r.id),
+        );
         for e in &r.evidence {
-            push_tokens(&e.summary, format!("review {}", r.id));
+            push_tokens(
+                &mut corpus,
+                &mut vias,
+                &mut seen,
+                &e.summary,
+                &format!("review {}", r.id),
+            );
         }
     }
-    corpus
+    (corpus, vias)
 }
 
-/// Corpus tokens searchable for one review item (for per-item hits).
-fn item_corpus(item: &ReviewItem) -> Vec<String> {
+/// Stripped added-line identifiers for one file (shared by the global
+/// corpus and per-item attribution so a diff-only term match still
+/// attributes to the items touching that file).
+fn diff_tokens(f: &rift_core::FileChange) -> Vec<String> {
     let mut toks = Vec::new();
-    for src in [&item.title, &item.why] {
-        toks.extend(split_ident(src));
-    }
-    for f in &item.files {
-        toks.extend(split_ident(f));
-    }
-    for s in &item.symbols {
-        toks.extend(split_ident(s));
-    }
-    for e in &item.evidence {
-        toks.extend(split_ident(&e.summary));
+    let mut lines = 0;
+    for h in &f.hunks {
+        for l in &h.lines {
+            if !matches!(l.kind, rift_core::DiffLineKind::Addition) {
+                continue;
+            }
+            lines += 1;
+            if lines > 500 {
+                return toks;
+            }
+            toks.extend(split_ident(&clean_line(&l.text)));
+        }
     }
     toks
 }
 
-fn match_score(term: &str, token: &str) -> f32 {
-    if term == token {
-        1.0
-    } else if (token.contains(term) || term.contains(token))
-        // Two-letter tokens (`in`, `of`, `to` from `for x in ...`) are
-        // substrings of almost everything; require both sides to carry
-        // real signal before calling it a stem match. Short terms still
-        // match exactly or via fuzzy bigrams below.
-        && term.len() >= 4
-        && token.len() >= 4
-    {
-        0.8
+/// One added line, stripped and capped for tokenizing: short lines
+/// without quotes or comment markers pass through borrow-only (the
+/// common case — no allocation), everything else takes the slow path.
+fn clean_line(text: &str) -> std::borrow::Cow<'_, str> {
+    // Byte length bounds char count from above, so `len() <= 300`
+    // guarantees the char cap without walking.
+    if text.len() <= 300 && !text.contains('"') && !text.contains("//") {
+        std::borrow::Cow::Borrowed(text)
     } else {
-        let s = bigram_sim(term, token);
-        if s >= FUZZY_THRESHOLD { s } else { 0.0 }
+        let capped: String = text.chars().take(300).collect();
+        std::borrow::Cow::Owned(strip_code_literals(&capped))
+    }
+}
+
+/// Corpus tokens searchable for one review item (for per-item hits).
+/// Deduplicated in first-occurrence order: matching takes the max per
+/// term, so repeats never change a verdict — only the pair count.
+fn item_corpus(item: &ReviewItem, file_tokens: &HashMap<&str, Vec<String>>) -> Vec<String> {
+    let mut toks: Vec<String> = Vec::new();
+    let mut seen = HashSet::new();
+    let push = |toks: &mut Vec<String>, seen: &mut HashSet<String>, s: String| {
+        if !seen.contains(s.as_str()) {
+            seen.insert(s.clone());
+            toks.push(s);
+        }
+    };
+    for src in [&item.title, &item.why] {
+        for t in split_ident(src) {
+            push(&mut toks, &mut seen, t);
+        }
+    }
+    for f in &item.files {
+        for t in split_ident(f) {
+            push(&mut toks, &mut seen, t);
+        }
+    }
+    for s in &item.symbols {
+        for t in split_ident(s) {
+            push(&mut toks, &mut seen, t);
+        }
+    }
+    for e in &item.evidence {
+        for t in split_ident(&e.summary) {
+            push(&mut toks, &mut seen, t);
+        }
+    }
+    for path in &item.files {
+        if let Some(ts) = file_tokens.get(path.as_str()) {
+            for t in ts {
+                push(&mut toks, &mut seen, t.clone());
+            }
+        }
+    }
+    toks
+}
+
+/// Score one term against one token with both bigram sets precomputed.
+/// Identical results to the old per-pair computation: exact 1.0,
+/// long-enough substring 0.8, else bigram Dice at threshold — with two
+/// shortcuts. Two-letter tokens (`in`, `of`, `to` from `for x in ...`)
+/// are substrings of almost everything, so stem matches require both
+/// sides to carry real signal; and the integer Dice bound skips pairs
+/// that cannot reach the threshold before any bigram work.
+fn match_score_owned(term: &str, term_g: &Bigrams, tok: &str, tok_g: &Bigrams) -> f32 {
+    if term == tok {
+        return 1.0;
+    }
+    if (tok.contains(term) || term.contains(tok)) && term.len() >= 4 && tok.len() >= 4 {
+        return 0.8;
+    }
+    if !dice_possible(term_g.chars, tok_g.chars) {
+        return 0.0;
+    }
+    let s = dice(term_g, tok_g);
+    if s >= FUZZY_THRESHOLD {
+        s
+    } else {
+        0.0
+    }
+}
+
+/// Lazy variant for short-lived token lists: the multiset builds on
+/// first fuzzy need and is reused for the remaining terms. Same scores
+/// as [`match_score_owned`] — one rule, two call shapes.
+fn match_score_lazy(term: &str, term_g: &Bigrams, tok: &str, slot: &mut Option<Bigrams>) -> f32 {
+    if term == tok {
+        return 1.0;
+    }
+    if (tok.contains(term) || term.contains(tok)) && term.len() >= 4 && tok.len() >= 4 {
+        return 0.8;
+    }
+    if !dice_possible(term_g.chars, tok.chars().count()) {
+        return 0.0;
+    }
+    let tok_g = slot.get_or_insert_with(|| bigrams_of(tok));
+    let s = dice(term_g, tok_g);
+    if s >= FUZZY_THRESHOLD {
+        s
+    } else {
+        0.0
     }
 }
 
 /// Match every task term against the corpus; returns (matched, unmatched).
-fn match_terms(terms: &[String], corpus: &[CorpusToken]) -> (Vec<TaskTermMatch>, Vec<String>) {
+/// Two phases per term with identical outcomes to a full scan: exact hits
+/// resolve by table lookup (attribution = first corpus occurrence, as the
+/// old scan's break did), and only terms without one pay the fuzzy scan.
+/// Corpus bigrams arrive precomputed (one pass over unique tokens), so the
+/// hot loop hashes nothing and allocates only the tiny Dice bitmap.
+fn match_terms(
+    terms: &[String],
+    term_grams: &[Bigrams],
+    corpus: &[CorpusToken],
+    corp_grams: &[Bigrams],
+    vias: &[String],
+) -> (Vec<TaskTermMatch>, Vec<String>) {
+    let exact: HashSet<&str> = corpus.iter().map(|t| t.token.as_str()).collect();
     let mut matched = Vec::new();
     let mut unmatched = Vec::new();
-    for term in terms {
-        let mut best: Option<(&CorpusToken, f32)> = None;
-        for tok in corpus {
-            let s = match_score(term, &tok.token);
+    for (term, term_g) in terms.iter().zip(term_grams.iter()) {
+        if exact.contains(term.as_str()) {
+            let via = corpus
+                .iter()
+                .find(|t| t.token == *term)
+                .map(|t| vias[t.via as usize].clone())
+                .unwrap_or_default();
+            matched.push(TaskTermMatch {
+                term: term.clone(),
+                matched_via: via,
+                score: 1.0,
+            });
+            continue;
+        }
+        let mut best: Option<(u32, f32)> = None;
+        for (tok, tok_g) in corpus.iter().zip(corp_grams.iter()) {
+            let s = match_score_owned(term, term_g, &tok.token, tok_g);
             if s > 0.0 && best.map(|(_, b)| s > b).unwrap_or(true) {
-                best = Some((tok, s));
-                if (s - 1.0).abs() < f32::EPSILON {
-                    break;
-                }
+                best = Some((tok.via, s));
             }
         }
         match best {
-            Some((tok, score)) => matched.push(TaskTermMatch {
+            Some((via, score)) => matched.push(TaskTermMatch {
                 term: term.clone(),
-                matched_via: tok.via.clone(),
+                matched_via: vias[via as usize].clone(),
                 score,
             }),
             None => unmatched.push(term.clone()),
@@ -295,23 +527,39 @@ pub fn check_task(cs: &ChangeSet, task_text: &str) -> TaskCheck {
             verdict: TaskVerdict::Uncovered,
         };
     }
-    let corpus = build_corpus(cs);
-    let (matched, unmatched) = match_terms(&terms, &corpus);
+    let (corpus, vias) = build_corpus(cs);
+    let term_grams: Vec<Bigrams> = terms.iter().map(|t| bigrams_of(t)).collect();
+    let corp_grams: Vec<Bigrams> = corpus.iter().map(|t| bigrams_of(&t.token)).collect();
+    let (matched, unmatched) = match_terms(&terms, &term_grams, &corpus, &corp_grams, &vias);
     let coverage = matched.len() as f32 / terms.len() as f32;
 
-    // Per-item attribution: which review items touch which task terms.
+    // Per-file diff tokens once (many items share files via moves), then
+    // per-item attribution over deduplicated tokens with precomputed
+    // bigrams. Comparisons reuse the corpus bigram cache, so repeated
+    // identifiers across items cost nothing extra.
+    let mut file_tokens: HashMap<&str, Vec<String>> = HashMap::new();
+    for f in &cs.files {
+        file_tokens
+            .entry(f.display_path())
+            .or_insert_with(|| diff_tokens(f));
+    }
     let matched_set: HashSet<&str> = matched.iter().map(|m| m.term.as_str()).collect();
     let mut hits: Vec<TaskItemHit> = Vec::new();
     for item in &cs.review_items {
-        let toks = item_corpus(item);
+        let toks = item_corpus(item, &file_tokens);
+        // Lazy per-token bigrams: most pairs resolve on ==/substring or
+        // the integer prefilter, so building multisets eagerly would
+        // allocate for tokens that never reach Dice.
+        let mut gram_slots: Vec<Option<Bigrams>> = vec![None; toks.len()];
         let mut hit_terms: Vec<String> = Vec::new();
-        for term in &terms {
+        for (term, term_g) in terms.iter().zip(term_grams.iter()) {
             if !matched_set.contains(term.as_str()) {
                 continue;
             }
             let mut best = 0.0f32;
-            for tok in &toks {
-                best = best.max(match_score(term, tok));
+            for (tok, slot) in toks.iter().zip(gram_slots.iter_mut()) {
+                let s = match_score_lazy(term, term_g, tok, slot);
+                best = best.max(s);
                 if (best - 1.0).abs() < f32::EPSILON {
                     break;
                 }
@@ -339,10 +587,11 @@ pub fn check_task(cs: &ChangeSet, task_text: &str) -> TaskCheck {
     hits.truncate(MAX_HITS);
 
     // Covered needs a strong majority (>=4 of 5); a single missing term
-    // out of three is Partial, not Covered.
+    // out of three is Partial, not Covered. The Partial floor is exactly
+    // 1/3 so one matched term out of three still reads as Partial.
     let verdict = if coverage >= 0.8 {
         TaskVerdict::Covered
-    } else if coverage >= 0.34 {
+    } else if coverage >= 1.0 / 3.0 {
         TaskVerdict::Partial
     } else {
         TaskVerdict::Uncovered
@@ -395,10 +644,14 @@ pub fn render_task_check(check: &TaskCheck) -> String {
     match check.verdict {
         TaskVerdict::Covered => {}
         TaskVerdict::Partial => {
-            s.push_str("  hint: some task terms have no matching change — check scope or wording.\n");
+            s.push_str(
+                "  hint: some task terms have no matching change — check scope or wording.\n",
+            );
         }
         TaskVerdict::Uncovered => {
-            s.push_str("  hint: no task term matches this diff — wrong branch, or work not started.\n");
+            s.push_str(
+                "  hint: no task term matches this diff — wrong branch, or work not started.\n",
+            );
         }
     }
     s
@@ -456,7 +709,11 @@ mod tests {
             confidence: 0.9,
             files: vec!["src/auth/session.rs".into()],
             symbols: vec!["session_timeout".into()],
-            evidence: vec![Evidence::new("timeout-change", "timeout 900 -> 86400", "src/auth/session.rs")],
+            evidence: vec![Evidence::new(
+                "timeout-change",
+                "timeout 900 -> 86400",
+                "src/auth/session.rs",
+            )],
             why: "Session timeout constant changed.".into(),
         }];
         ChangeSet {
@@ -531,10 +788,7 @@ mod tests {
     fn fuzzy_matches_typos() {
         let cs = harness();
         let c = check_task(&cs, "sesion timout");
-        assert!(
-            c.coverage > 0.0,
-            "close typos should fuzzy-match: {c:?}"
-        );
+        assert!(c.coverage > 0.0, "close typos should fuzzy-match: {c:?}");
     }
 
     #[test]
@@ -549,11 +803,14 @@ mod tests {
 
     #[test]
     fn short_tokens_are_not_substring_matches() {
-        assert_eq!(super::match_score("invoicing", "in"), 0.0);
-        assert_eq!(super::match_score("timeout", "to"), 0.0);
+        fn scored(term: &str, tok: &str) -> f32 {
+            super::match_score_owned(term, &super::bigrams_of(term), tok, &super::bigrams_of(tok))
+        }
+        assert_eq!(scored("invoicing", "in"), 0.0);
+        assert_eq!(scored("timeout", "to"), 0.0);
         // Exact and long-stem matches still work.
-        assert_eq!(super::match_score("timeout", "timeout"), 1.0);
-        assert_eq!(super::match_score("rewrite", "rewrites"), 0.8);
+        assert_eq!(scored("timeout", "timeout"), 1.0);
+        assert_eq!(scored("rewrite", "rewrites"), 0.8);
     }
 
     #[test]
@@ -586,6 +843,42 @@ mod tests {
         });
         let c = check_task(&cs, "invoicing zebra");
         assert_eq!(c.verdict, TaskVerdict::Uncovered, "{c:?}");
+    }
+
+    #[test]
+    fn one_of_three_is_partial_not_uncovered() {
+        let cs = harness();
+        let c = check_task(&cs, "session timeout zebra");
+        assert_eq!(c.coverage, 2.0 / 3.0);
+        assert_eq!(c.verdict, TaskVerdict::Partial, "{c:?}");
+    }
+
+    #[test]
+    fn diff_only_term_still_attributes_to_item() {
+        use rift_core::{DiffLine, DiffLineKind, Hunk};
+        // Term appears only in added diff lines (no symbol/title match).
+        let mut cs = harness();
+        cs.symbol_changes.clear();
+        if let Some(item) = cs.review_items.first_mut() {
+            item.symbols.clear();
+            item.title = "unrelated change".into();
+            item.why = String::new();
+            item.evidence.clear();
+        }
+        cs.files[0].hunks = vec![Hunk {
+            old_start: 1,
+            old_lines: 0,
+            new_start: 1,
+            new_lines: 1,
+            header: String::new(),
+            lines: vec![DiffLine {
+                kind: DiffLineKind::Addition,
+                text: "invoicing_total += zebra_count;".into(),
+            }],
+        }];
+        let c = check_task(&cs, "invoicing zebra");
+        assert_eq!(c.verdict, TaskVerdict::Covered, "{c:?}");
+        assert_eq!(c.item_hits.len(), 1, "diff match attributes: {c:?}");
     }
 
     #[test]

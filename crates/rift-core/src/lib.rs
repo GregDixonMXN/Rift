@@ -23,7 +23,11 @@ impl Language {
         let lower = path.to_lowercase();
         if lower.ends_with(".rs") {
             Self::Rust
-        } else if lower.ends_with(".ts") || lower.ends_with(".tsx") || lower.ends_with(".mts") {
+        } else if lower.ends_with(".ts")
+            || lower.ends_with(".tsx")
+            || lower.ends_with(".mts")
+            || lower.ends_with(".cts")
+        {
             Self::TypeScript
         } else if lower.ends_with(".js")
             || lower.ends_with(".jsx")
@@ -31,7 +35,7 @@ impl Language {
             || lower.ends_with(".cjs")
         {
             Self::JavaScript
-        } else if lower.ends_with(".py") {
+        } else if lower.ends_with(".py") || lower.ends_with(".pyi") {
             Self::Python
         } else if lower.ends_with(".cs") {
             Self::CSharp

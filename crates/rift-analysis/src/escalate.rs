@@ -7,8 +7,8 @@
 //! to fixed budgets. Deterministic: same ChangeSet in, same bytes out.
 
 use rift_core::{
-    Category, ChangeSet, EscalationItem, EscalationPackage, EscalationTask,
-    ESCALATION_SCHEMA_VERSION, ReviewItem, Severity,
+    Category, ChangeSet, EscalationItem, EscalationPackage, EscalationTask, ReviewItem, Severity,
+    ESCALATION_SCHEMA_VERSION,
 };
 
 /// Default severity floor: escalate High and Critical items.
@@ -59,18 +59,46 @@ fn candidates(cs: &ChangeSet, floor: Severity) -> Vec<&ReviewItem> {
     v
 }
 
+/// Evidence kinds that most deserve LLM attention, highest first.
+/// The scorer appends signals in pipeline order (structural first,
+/// content signals last), so without this the 8-slot cap could drop a
+/// `secret-handling` Critical sitting behind eight `symbol-removed`s.
+const EVIDENCE_PRIORITY: &[&str] = &[
+    "secret-handling",
+    "unsafe",
+    "validation-removed",
+    "untested-change",
+    "blast-radius",
+    "auth-surface",
+    "symbol-removed",
+    "schema",
+];
+
+fn evidence_rank(kind: &str) -> usize {
+    EVIDENCE_PRIORITY
+        .iter()
+        .position(|k| *k == kind)
+        .unwrap_or(EVIDENCE_PRIORITY.len())
+}
+
 fn compact_item(item: &ReviewItem) -> EscalationItem {
     let title = truncate(&item.title, MAX_TITLE);
     let why = truncate(&item.why, MAX_WHY);
-    // Pipeline order is deterministic, so keep it (most severe signals
-    // already sort first upstream via item priority).
-    let evidence: Vec<String> = item
-        .evidence
-        .iter()
+    // Highest-signal evidence first (stable: pipeline order wins ties),
+    // then the cap. Deterministic either way.
+    let mut evidence: Vec<&rift_core::Evidence> = item.evidence.iter().collect();
+    evidence.sort_by_key(|e| evidence_rank(&e.kind));
+    let evidence: Vec<String> = evidence
+        .into_iter()
         .take(MAX_EVIDENCE_PER_ITEM)
         .map(|e| truncate(&format!("{}: {}", e.kind, e.summary), MAX_EVIDENCE_SUMMARY))
         .collect();
-    let files: Vec<String> = item.files.iter().take(MAX_FILES_PER_ITEM).cloned().collect();
+    let files: Vec<String> = item
+        .files
+        .iter()
+        .take(MAX_FILES_PER_ITEM)
+        .cloned()
+        .collect();
     let symbols: Vec<String> = item
         .symbols
         .iter()
@@ -99,10 +127,15 @@ fn compact_item(item: &ReviewItem) -> EscalationItem {
     }
 }
 
+/// Max task-gap terms carried in the package (the full list stays in
+/// the ChangeSet's `task_check`; the package is token-budgeted).
+const MAX_UNMATCHED: usize = 25;
+
 /// Build the escalation package for a reviewed ChangeSet. Pure function:
-/// no I/O, no network, deterministic.
+/// no I/O, no network, deterministic. `max_items == 0` yields an empty
+/// package (nothing to escalate).
 pub fn build_package(cs: &ChangeSet, floor: Severity, max_items: usize) -> EscalationPackage {
-    let max_items = max_items.clamp(1, MAX_ITEMS_LIMIT);
+    let max_items = max_items.min(MAX_ITEMS_LIMIT);
     let items: Vec<EscalationItem> = candidates(cs, floor)
         .into_iter()
         .take(max_items)
@@ -111,7 +144,7 @@ pub fn build_package(cs: &ChangeSet, floor: Severity, max_items: usize) -> Escal
     let task = cs.task_check.as_ref().map(|t| EscalationTask {
         text: truncate(&t.task_text, MAX_WHY),
         verdict: t.verdict,
-        unmatched: t.unmatched.clone(),
+        unmatched: t.unmatched.iter().take(MAX_UNMATCHED).cloned().collect(),
     });
     let body: u32 = items.iter().map(|i| i.approx_tokens).sum();
     let envelope = approx_tokens(&format!(
@@ -157,10 +190,7 @@ pub fn render_summary(pkg: &EscalationPackage) -> String {
         } else {
             t.unmatched.join(", ")
         };
-        s.push_str(&format!(
-            "  task [{:?}], gaps: {}\n",
-            t.verdict, gaps
-        ));
+        s.push_str(&format!("  task [{:?}], gaps: {}\n", t.verdict, gaps));
     }
     if pkg.items.is_empty() {
         s.push_str("  no items at or above the floor — nothing to escalate.\n");
@@ -192,7 +222,9 @@ fn single_line(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rift_core::{Category, ChangeStats, Evidence, ReviewItem, Severity, TaskCheck, TaskVerdict};
+    use rift_core::{
+        Category, ChangeStats, Evidence, ReviewItem, Severity, TaskCheck, TaskVerdict,
+    };
 
     fn item(id: &str, severity: Severity, category: Category) -> ReviewItem {
         ReviewItem {
@@ -204,7 +236,11 @@ mod tests {
             confidence: 0.8,
             files: vec!["src/a.rs".into()],
             symbols: vec!["run".into()],
-            evidence: vec![Evidence::new("timeout-change", "timeout 900 -> 86400", "src/a.rs")],
+            evidence: vec![Evidence::new(
+                "timeout-change",
+                "timeout 900 -> 86400",
+                "src/a.rs",
+            )],
             why: "because reasons".into(),
         }
     }
@@ -278,12 +314,22 @@ mod tests {
             .collect();
         let pkg = build_package(&cs_with(vec![it]), Severity::High, 10);
         let e = &pkg.items[0];
-        assert!(e.title.chars().count() <= MAX_TITLE + 1, "{}", e.title.len());
+        assert!(
+            e.title.chars().count() <= MAX_TITLE + 1,
+            "{}",
+            e.title.len()
+        );
         assert!(e.why.chars().count() <= MAX_WHY + 1);
         assert_eq!(e.evidence.len(), MAX_EVIDENCE_PER_ITEM);
-        assert!(e.evidence.iter().all(|s| s.chars().count() <= MAX_EVIDENCE_SUMMARY + 1));
+        assert!(e
+            .evidence
+            .iter()
+            .all(|s| s.chars().count() <= MAX_EVIDENCE_SUMMARY + 1));
         assert!(e.approx_tokens > 0);
-        assert_eq!(pkg.approx_tokens, e.approx_tokens + pkg.approx_tokens - e.approx_tokens);
+        assert_eq!(
+            pkg.approx_tokens,
+            e.approx_tokens + pkg.approx_tokens - e.approx_tokens
+        );
     }
 
     #[test]
@@ -302,6 +348,35 @@ mod tests {
         let t = pkg.task.expect("task context");
         assert_eq!(t.verdict, TaskVerdict::Partial);
         assert_eq!(t.unmatched, vec!["invoicing"]);
+    }
+
+    #[test]
+    fn severest_evidence_survives_the_cap() {
+        let mut it = item("big", Severity::Critical, Category::Security);
+        it.evidence = (0..8)
+            .map(|n| Evidence::new("symbol-removed", &format!("removed {n}"), "f.rs"))
+            .chain(std::iter::once(Evidence::new(
+                "secret-handling",
+                "secret/credential handling touched",
+                "f.rs",
+            )))
+            .collect();
+        let pkg = build_package(&cs_with(vec![it]), Severity::High, 10);
+        let kinds: Vec<&str> = pkg.items[0]
+            .evidence
+            .iter()
+            .map(|s| s.split(':').next().unwrap_or(""))
+            .collect();
+        assert!(kinds.contains(&"secret-handling"), "{kinds:?}");
+        assert_eq!(pkg.items[0].evidence.len(), MAX_EVIDENCE_PER_ITEM);
+    }
+
+    #[test]
+    fn zero_cap_yields_empty_package() {
+        let cs = cs_with(vec![item("high", Severity::High, Category::Behavior)]);
+        let pkg = build_package(&cs, Severity::High, 0);
+        assert!(pkg.items.is_empty());
+        assert!(render_summary(&pkg).contains("nothing to escalate"));
     }
 
     #[test]

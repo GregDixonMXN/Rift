@@ -26,3 +26,7 @@ harness = false
 [[bench]]
 name = "scale"
 harness = false
+
+[[bench]]
+name = "task"
+harness = false
