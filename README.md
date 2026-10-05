@@ -47,6 +47,10 @@ Gate commits on severity (batch only, exit 2 when triggered):
 
     rift --staged --overview --fail-on high
 
+Gate an agent's work on its task description (exit 2 unless Covered):
+
+    rift --overview --task @task.md --fail-on-task partial
+
 Install as a pre-commit hook (reviews what you're about to commit):
 
     cat > .git/hooks/pre-commit <<'EOF'

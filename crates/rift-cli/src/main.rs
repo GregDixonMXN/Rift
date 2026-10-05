@@ -76,6 +76,13 @@ struct Args {
     /// section in --overview and embeds `task_check` in --json.
     #[arg(long, value_name = "TASK")]
     task: Option<String>,
+
+    /// CI/hook gate on the task check (batch only, needs --task): exit 2
+    /// when the task verdict is this level or worse. Levels (best to
+    /// worst): covered, partial, uncovered. So `--fail-on-task partial`
+    /// requires Covered, while `uncovered` only fails a total miss.
+    #[arg(long, value_name = "VERDICT")]
+    fail_on_task: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -101,10 +108,34 @@ fn main() -> Result<()> {
                 std::process::exit(2);
             }
         }
+        if let Some(level) = args.fail_on_task.as_deref() {
+            let threshold = parse_task_verdict(level)?;
+            let check = cs.task_check.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("--fail-on-task needs --task (no task was checked)")
+            })?;
+            if task_gate_triggered(check, threshold) {
+                eprintln!(
+                    "rift: task gate {level} triggered — [{:?}] {}% ({} of {} terms, missing: {})",
+                    check.verdict,
+                    (check.coverage * 100.0).round() as u32,
+                    check.matched.len(),
+                    check.terms.len(),
+                    if check.unmatched.is_empty() {
+                        "none".to_string()
+                    } else {
+                        check.unmatched.join(", ")
+                    }
+                );
+                std::process::exit(2);
+            }
+        }
         return Ok(());
     }
     if args.task.is_some() {
         eprintln!("rift: --task needs --overview, --json, or --no-gui; ignoring it for the GUI run");
+    }
+    if args.fail_on_task.is_some() {
+        eprintln!("rift: --fail-on-task needs --overview, --json, or --no-gui; ignoring it for the GUI run");
     }
     let engine = open_repo(&args.path)?;
     let root = engine.root.to_string_lossy().replace('\\', "/");
@@ -303,6 +334,37 @@ fn parse_severity(level: &str) -> Result<rift_core::Severity> {
     }
 }
 
+/// Parse a `--fail-on-task` level. Case-insensitive; errors list the valid
+/// levels (best to worst: covered, partial, uncovered).
+fn parse_task_verdict(level: &str) -> Result<rift_core::TaskVerdict> {
+    use rift_core::TaskVerdict;
+    match level.to_lowercase().as_str() {
+        "covered" | "cover" => Ok(TaskVerdict::Covered),
+        "partial" => Ok(TaskVerdict::Partial),
+        "uncovered" | "uncover" => Ok(TaskVerdict::Uncovered),
+        other => anyhow::bail!(
+            "invalid --fail-on-task level '{other}': expected covered, partial, or uncovered"
+        ),
+    }
+}
+
+/// Quality rank for verdicts (higher is better). The gate fires when the
+/// check's rank is at or below the threshold's rank — i.e. the verdict is
+/// the threshold level or worse.
+fn verdict_rank(v: rift_core::TaskVerdict) -> u8 {
+    use rift_core::TaskVerdict;
+    match v {
+        TaskVerdict::Covered => 2,
+        TaskVerdict::Partial => 1,
+        TaskVerdict::Uncovered => 0,
+    }
+}
+
+/// Whether the task gate fires: verdict at or below `threshold` quality.
+fn task_gate_triggered(check: &rift_core::TaskCheck, threshold: rift_core::TaskVerdict) -> bool {
+    verdict_rank(check.verdict) <= verdict_rank(threshold)
+}
+
 /// Highest-priority meaningful item at or above `threshold`, if any.
 /// Mechanical items never gate (they are collapsed output, not risk); an
 /// empty or all-mechanical review always passes.
@@ -405,6 +467,54 @@ mod tests {
         );
         assert!(resolve_task_text(Some("@/nonexistent-rift-task-xyz.md")).is_err());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parses_task_verdicts_case_insensitively() {
+        use rift_core::TaskVerdict;
+        assert_eq!(parse_task_verdict("covered").unwrap(), TaskVerdict::Covered);
+        assert_eq!(parse_task_verdict("PARTIAL").unwrap(), TaskVerdict::Partial);
+        assert_eq!(
+            parse_task_verdict("uncovered").unwrap(),
+            TaskVerdict::Uncovered
+        );
+        assert!(parse_task_verdict("extreme").is_err());
+    }
+
+    #[test]
+    fn task_gate_fires_at_or_below_threshold() {
+        use rift_core::{TaskCheck, TaskVerdict};
+        let check = |verdict| TaskCheck {
+            task_text: "t".into(),
+            terms: vec!["t".into()],
+            matched: vec![],
+            unmatched: vec!["t".into()],
+            item_hits: vec![],
+            coverage: 0.0,
+            verdict,
+        };
+        // Threshold partial: Partial and Uncovered fail, Covered passes.
+        assert!(task_gate_triggered(
+            &check(TaskVerdict::Uncovered),
+            TaskVerdict::Partial
+        ));
+        assert!(task_gate_triggered(
+            &check(TaskVerdict::Partial),
+            TaskVerdict::Partial
+        ));
+        assert!(!task_gate_triggered(
+            &check(TaskVerdict::Covered),
+            TaskVerdict::Partial
+        ));
+        // Threshold uncovered: only a total miss fails.
+        assert!(task_gate_triggered(
+            &check(TaskVerdict::Uncovered),
+            TaskVerdict::Uncovered
+        ));
+        assert!(!task_gate_triggered(
+            &check(TaskVerdict::Partial),
+            TaskVerdict::Uncovered
+        ));
     }
 
 }
