@@ -173,3 +173,69 @@ fn agent_patch_review() {
     );
     assert_eq!(cs.stats.mechanical_files, 2);
 }
+
+#[test]
+fn behavior_changes_survive_formatting_filters() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = git2::Repository::init(dir.path()).expect("init");
+    let cases = [
+        (
+            "src/auth.rs",
+            "pub fn authenticate() {\n    validate();\n    grant();\n}\n",
+            "pub fn authenticate() {\n    grant();\n    validate();\n}\n",
+            "authenticate",
+        ),
+        (
+            "src/session.py",
+            "def save_session():\n    if ready():\n        run()\n        save()\n",
+            "def save_session():\n    if ready():\n        run()\n    save()\n",
+            "save_session",
+        ),
+        (
+            "src/message.rs",
+            "pub fn message() -> &'static str {\n    \"a b\"\n}\n",
+            "pub fn message() -> &'static str {\n    \"ab\"\n}\n",
+            "message",
+        ),
+        (
+            "src/template.rs",
+            "pub fn template() -> &'static str {\n    r#\"first\n    second\"#\n}\n",
+            "pub fn template() -> &'static str {\n    r#\"first\n        second\"#\n}\n",
+            "template",
+        ),
+    ];
+    for (path, old, _, _) in cases {
+        write(dir.path(), path, old);
+    }
+    commit_all(&repo, "baseline");
+    for (path, _, new, _) in cases {
+        write(dir.path(), path, new);
+    }
+    commit_all(&repo, "behavior changes");
+    let engine = rift_git::GitEngine::discover(dir.path()).expect("discover");
+    let mut files = engine.range_changeset("HEAD~1", "HEAD").expect("diff");
+    let root = engine.root.to_string_lossy().to_string();
+    let (symbols, items) = rift_analysis::analyze(&root, "HEAD~1", "HEAD", &mut files);
+    for (path, _, _, name) in cases {
+        assert!(
+            items
+                .iter()
+                .any(|item| item.category != Category::Mechanical
+                    && item.files.iter().any(|file| file == path)),
+            "missing meaningful item for {path}"
+        );
+        assert!(
+            !items
+                .iter()
+                .any(|item| item.category == Category::Mechanical
+                    && item.files.iter().any(|file| file == path)),
+            "hidden change in {path}"
+        );
+        assert!(
+            symbols.iter().any(|symbol| symbol.file == path
+                && symbol.name == name
+                && symbol.change == SymbolChangeKind::Modified),
+            "missing modified symbol for {path}: {symbols:?}"
+        );
+    }
+}

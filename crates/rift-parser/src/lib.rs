@@ -1658,15 +1658,7 @@ fn bodies_differ(old_lines: &[&str], new_lines: &[&str], os: &Symbol, ns: &Symbo
     if o.is_empty() || n.is_empty() {
         return false;
     }
-    normalize(&o) != normalize(&n)
-}
-
-fn normalize(s: &str) -> String {
-    s.lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
+    o != n
 }
 
 fn str_sim(a: &str, b: &str) -> f32 {

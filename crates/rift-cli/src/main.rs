@@ -53,8 +53,11 @@ struct Args {
     #[arg(long)]
     no_gui: bool,
 
-    /// Accepted for forward-compat; Rift is local-first and deterministic.
-    #[arg(long)]
+    #[arg(
+        long,
+        conflicts_with = "jev",
+        help = "Enforce offline review (conflicts with --jev; --jev-local is allowed)"
+    )]
     no_ai: bool,
 
     /// Ask Jev (TypeSafe cloud API) for risk/severity judgments on each
@@ -631,6 +634,73 @@ mod tests {
             stats: Default::default(),
             task_check: None,
         }
+    }
+
+    #[test]
+    fn offline_mode_rejects_cloud_judgments_before_analysis() {
+        for flags in [
+            vec!["rift", "--no-ai", "--jev"],
+            vec!["rift", "--jev", "--no-ai", "--overview"],
+            vec!["rift", "--no-ai", "--jev", "--json"],
+            vec!["rift", "--no-ai", "--jev", "--format", "github"],
+            vec!["rift", "--no-ai", "--jev", "--escalate"],
+        ] {
+            let error =
+                Args::try_parse_from(flags).expect_err("cloud must conflict with offline mode");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+    }
+
+    #[test]
+    fn behavioral_whitespace_changes_remain_gate_eligible() {
+        for (path, old, new) in [
+            (
+                "auth.rs",
+                "pub fn authenticate() {\n    validate();\n    grant();\n}\n",
+                "pub fn authenticate() {\n    grant();\n    validate();\n}\n",
+            ),
+            (
+                "auth.py",
+                "def authenticate():\n    if ready():\n        validate()\n        grant()\n",
+                "def authenticate():\n    if ready():\n        validate()\n    grant()\n",
+            ),
+            (
+                "auth.rs",
+                "pub fn authenticate() {\n    check(\"a b\");\n}\n",
+                "pub fn authenticate() {\n    check(\"ab\");\n}\n",
+            ),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let repo = git2::Repository::init(dir.path()).expect("init");
+            std::fs::write(dir.path().join(path), old).expect("baseline");
+            let mut index = repo.index().expect("index");
+            index.add_path(Path::new(path)).expect("add");
+            index.write().expect("write index");
+            let tree_id = index.write_tree().expect("tree");
+            let tree = repo.find_tree(tree_id).expect("find tree");
+            let sig = git2::Signature::now("rift-test", "rift@test").expect("signature");
+            repo.commit(Some("HEAD"), &sig, &sig, "baseline", &tree, &[])
+                .expect("commit");
+            std::fs::write(dir.path().join(path), new).expect("change");
+            let mut args = test_args(dir.path().to_path_buf());
+            args.overview = true;
+            args.no_ai = true;
+            args.install_hook = false;
+            let cs = build_changeset(&args).expect("analyze");
+            assert!(
+                gate_trigger(&cs, Severity::High).is_some(),
+                "behavior change escaped gate: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn offline_mode_allows_deterministic_judgments() {
+        let args = Args::try_parse_from(["rift", "--no-ai", "--jev-local", "--overview"])
+            .expect("local judgments are offline");
+        assert!(args.no_ai);
+        assert!(args.jev_local);
+        assert!(!args.jev);
     }
 
     #[test]

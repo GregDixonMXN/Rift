@@ -124,41 +124,28 @@ impl FileChange {
         }
     }
 
-    /// Formatting-only heuristic: compare whitespace-stripped line multisets.
-    /// Indentation or brace reflow yields identical multisets; any token
-    /// change (including comments) does not. Pure add/delete is never
-    /// formatting-only.
     pub fn looks_formatting_only(&self) -> bool {
-        if self.hunks.is_empty() {
+        if self.language != Language::Rust
+            || self.status != FileStatus::Modified
+            || self.is_binary
+            || self.hunks.is_empty()
+        {
             return false;
         }
-        let mut del = Vec::new();
-        let mut add = Vec::new();
-        for h in &self.hunks {
-            for l in &h.lines {
-                match l.kind {
-                    DiffLineKind::Context => {}
-                    DiffLineKind::Addition => {
-                        let t: String = l.text.chars().filter(|c| !c.is_whitespace()).collect();
-                        if !t.is_empty() {
-                            add.push(t);
-                        }
-                    }
-                    DiffLineKind::Deletion => {
-                        let t: String = l.text.chars().filter(|c| !c.is_whitespace()).collect();
-                        if !t.is_empty() {
-                            del.push(t);
-                        }
-                    }
-                }
-            }
-        }
-        if del.is_empty() || add.is_empty() {
+        let (Some(old), Some(new)) = (&self.old_content, &self.new_content) else {
+            return false;
+        };
+        if old == new
+            || old.contains(['\"', '\'', '/', '\\'])
+            || new.contains(['\"', '\'', '/', '\\'])
+        {
             return false;
         }
-        del.sort();
-        add.sort();
-        del == add
+        old.split('\n')
+            .map(|line| line.trim_start_matches([' ', '\t']))
+            .eq(new
+                .split('\n')
+                .map(|line| line.trim_start_matches([' ', '\t'])))
     }
 }
 
@@ -401,5 +388,123 @@ impl ChangeSet {
                 .then(a.title.cmp(&b.title))
         });
         v
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn changed_file(language: Language, old: &str, new: &str) -> FileChange {
+        FileChange {
+            old_path: "example".into(),
+            new_path: "example".into(),
+            status: FileStatus::Modified,
+            language,
+            is_binary: false,
+            is_generated: false,
+            is_test_file: false,
+            added_lines: new.lines().count(),
+            deleted_lines: old.lines().count(),
+            hunks: vec![Hunk {
+                old_start: 1,
+                old_lines: old.lines().count() as u32,
+                new_start: 1,
+                new_lines: new.lines().count() as u32,
+                header: String::new(),
+                lines: old
+                    .lines()
+                    .map(|text| DiffLine {
+                        kind: DiffLineKind::Deletion,
+                        text: text.into(),
+                    })
+                    .chain(new.lines().map(|text| DiffLine {
+                        kind: DiffLineKind::Addition,
+                        text: text.into(),
+                    }))
+                    .collect(),
+            }],
+            old_content: Some(old.into()),
+            new_content: Some(new.into()),
+        }
+    }
+
+    #[test]
+    fn reordered_statements_are_not_formatting() {
+        let file = changed_file(
+            Language::Rust,
+            "fn f() {\n    first();\n    second();\n}\n",
+            "fn f() {\n    second();\n    first();\n}\n",
+        );
+        assert!(!file.looks_formatting_only());
+    }
+
+    #[test]
+    fn python_indentation_is_not_formatting() {
+        let file = changed_file(
+            Language::Python,
+            "def f():\n    if ready():\n        run()\n        save()\n",
+            "def f():\n    if ready():\n        run()\n    save()\n",
+        );
+        assert!(!file.looks_formatting_only());
+    }
+
+    #[test]
+    fn literal_whitespace_is_not_formatting() {
+        for (language, old, new) in [
+            (
+                Language::Rust,
+                "fn f() { let value = \"a b\"; }",
+                "fn f() { let value = \"ab\"; }",
+            ),
+            (
+                Language::JavaScript,
+                "const value = `a b`;",
+                "const value = `ab`;",
+            ),
+            (Language::Python, "value = 'a b'", "value = 'ab'"),
+            (
+                Language::Rust,
+                "fn f() { let value = r#\"first\n    second\"#; }",
+                "fn f() { let value = r#\"first\n        second\"#; }",
+            ),
+        ] {
+            assert!(
+                !changed_file(language, old, new).looks_formatting_only(),
+                "{language:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn token_boundaries_are_not_formatting() {
+        let file = changed_file(
+            Language::Rust,
+            "fn f() { let amount = 1; }",
+            "fn f() { letamount = 1; }",
+        );
+        assert!(!file.looks_formatting_only());
+    }
+
+    #[test]
+    fn simple_rust_indentation_is_formatting() {
+        let file = changed_file(
+            Language::Rust,
+            "fn f() {\n    run();\n}\n",
+            "fn f() {\n        run();\n}\n",
+        );
+        assert!(file.looks_formatting_only());
+    }
+
+    #[test]
+    fn uncertain_formatting_stays_visible() {
+        let old = "fn f() {\n    run();\n}\n";
+        let new = "fn f() {\n        run();\n}\n";
+        let mut file = changed_file(Language::Rust, old, new);
+        file.old_content = None;
+        assert!(!file.looks_formatting_only());
+        for language in [Language::Unknown, Language::Go, Language::JavaScript] {
+            assert!(!changed_file(language, old, new).looks_formatting_only());
+        }
     }
 }

@@ -12,6 +12,7 @@ matters, and what deserves human attention — before you merge.
     rift --json           # machine-readable ChangeSet (for agents/tools)
     rift --jev --overview # add Jev risk/severity judgments (needs TYPESAFE_API_KEY)
     rift --jev-local --overview # same evidence kinds, computed offline (no key)
+    rift --no-ai --overview # enforce offline mode; rejects --jev
     rift --overview --task "extend session timeout" # task-vs-change coverage check
     rift --overview --task @task.md # same, description read from a file
     rift --escalate --json # compact evidence-only package for an external LLM
@@ -22,6 +23,15 @@ matters, and what deserves human attention — before you merge.
 No accounts, no cloud, no config. Local-first and deterministic: parsing and
 static signals come before any probabilistic judgment, and every conclusion
 carries evidence you can drill into.
+
+`--no-ai` rejects `--jev` before analysis or network access, in both GUI and
+batch modes. Offline `--jev-local` remains available. Cloud judgments always
+require an explicit `--jev` flag.
+
+Formatting collapse is deliberately conservative: only leading indentation
+changes in fully available Rust files without literals or comment markers are
+classified as formatting-only. Statement order, Python indentation, literal
+whitespace, and uncertain edits stay visible for review and severity gates.
 
 ## Layout
 
