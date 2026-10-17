@@ -224,6 +224,7 @@ mod tests {
     use super::*;
     use rift_core::{
         Category, ChangeStats, Evidence, ReviewItem, Severity, TaskCheck, TaskVerdict,
+        CHANGESET_SCHEMA_VERSION,
     };
 
     fn item(id: &str, severity: Severity, category: Category) -> ReviewItem {
@@ -247,6 +248,7 @@ mod tests {
 
     fn cs_with(items: Vec<ReviewItem>) -> ChangeSet {
         ChangeSet {
+            schema_version: CHANGESET_SCHEMA_VERSION,
             repo_root: ".".into(),
             base_ref: "H".into(),
             head_ref: "w".into(),

@@ -365,8 +365,21 @@ pub struct EscalationPackage {
     pub approx_tokens: u32,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Schema version of the serialized `ChangeSet` (`rift --json` output).
+/// External consumers (control planes, CI gates) must check this field
+/// before parsing: unknown versions mean the shape may have changed.
+pub const CHANGESET_SCHEMA_VERSION: u32 = 1;
+
+fn default_changeset_schema_version() -> u32 {
+    CHANGESET_SCHEMA_VERSION
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChangeSet {
+    /// Schema version, serialized first so parsers can bail out early.
+    /// Old payloads without the field read back as version 1.
+    #[serde(default = "default_changeset_schema_version")]
+    pub schema_version: u32,
     pub repo_root: String,
     pub base_ref: String,
     pub head_ref: String,
@@ -376,6 +389,22 @@ pub struct ChangeSet {
     pub stats: ChangeStats,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_check: Option<TaskCheck>,
+}
+
+impl Default for ChangeSet {
+    fn default() -> Self {
+        Self {
+            schema_version: CHANGESET_SCHEMA_VERSION,
+            repo_root: String::new(),
+            base_ref: String::new(),
+            head_ref: String::new(),
+            files: Vec::new(),
+            symbol_changes: Vec::new(),
+            review_items: Vec::new(),
+            stats: ChangeStats::default(),
+            task_check: None,
+        }
+    }
 }
 
 impl ChangeSet {

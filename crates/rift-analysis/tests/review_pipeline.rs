@@ -156,6 +156,7 @@ fn agent_patch_review() {
 
     // 4. Stats tell the north-star story: few meaningful, rest collapsed.
     let mut cs = rift_core::ChangeSet {
+        schema_version: rift_core::CHANGESET_SCHEMA_VERSION,
         repo_root: root,
         base_ref: "HEAD~1".into(),
         head_ref: "HEAD".into(),

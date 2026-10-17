@@ -681,7 +681,7 @@ mod tests {
     use super::*;
     use rift_core::{
         Category, ChangeSet, ChangeStats, Evidence, FileChange, FileStatus, Hunk, Language,
-        ReviewItem, Severity, SymbolChange, SymbolChangeKind, SymbolKind,
+        ReviewItem, Severity, SymbolChange, SymbolChangeKind, SymbolKind, CHANGESET_SCHEMA_VERSION,
     };
 
     #[test]
@@ -732,6 +732,7 @@ mod tests {
             why: "Session timeout constant changed.".into(),
         }];
         ChangeSet {
+            schema_version: CHANGESET_SCHEMA_VERSION,
             repo_root: ".".into(),
             base_ref: "HEAD".into(),
             head_ref: "worktree".into(),

@@ -1,4 +1,5 @@
 {
+  "schema_version": 1,
   "repo_root": "<ROOT>",
   "base_ref": "HEAD~1",
   "head_ref": "HEAD",

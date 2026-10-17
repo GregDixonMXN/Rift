@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use rift_core::ChangeSet;
+use rift_core::{ChangeSet, CHANGESET_SCHEMA_VERSION};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
@@ -305,6 +305,7 @@ fn build_changeset(args: &Args) -> Result<ChangeSet> {
         }
     }
     let mut cs = ChangeSet {
+        schema_version: CHANGESET_SCHEMA_VERSION,
         repo_root: root,
         base_ref,
         head_ref,
@@ -625,6 +626,7 @@ mod tests {
 
     fn cs_with(items: Vec<ReviewItem>) -> ChangeSet {
         ChangeSet {
+            schema_version: CHANGESET_SCHEMA_VERSION,
             repo_root: ".".into(),
             base_ref: "H".into(),
             head_ref: "w".into(),

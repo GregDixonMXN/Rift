@@ -6,7 +6,7 @@
 //! The snapshot pins severity/category/priority/evidence so scoring
 //! regressions fail loudly. `repo_root` is normalized to `<ROOT>`.
 
-use rift_core::ChangeSet;
+use rift_core::{ChangeSet, CHANGESET_SCHEMA_VERSION};
 use std::path::{Path, PathBuf};
 
 const AUTH_V1: &str = r#"pub const SESSION_TIMEOUT: u64 = 900;
@@ -85,6 +85,7 @@ fn build_changeset() -> ChangeSet {
 
     let (syms, items) = rift_analysis::analyze("<ROOT>", "HEAD~1", "HEAD", &mut files);
     let mut cs = ChangeSet {
+        schema_version: CHANGESET_SCHEMA_VERSION,
         repo_root: "<ROOT>".to_string(),
         base_ref: "HEAD~1".into(),
         head_ref: "HEAD".into(),

@@ -4,8 +4,8 @@
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use rift_core::{
-    Category, ChangeSet, ChangeStats, DiffLine, DiffLineKind, FileChange, FileStatus, Hunk,
-    Language, ReviewItem, Severity,
+    Category, CHANGESET_SCHEMA_VERSION, ChangeSet, ChangeStats, DiffLine, DiffLineKind, FileChange,
+    FileStatus, Hunk, Language, ReviewItem, Severity,
 };
 
 const WORDS: &[&str] = &[
@@ -63,6 +63,7 @@ fn changeset(n_files: usize, lines_per_file: usize) -> ChangeSet {
         });
     }
     ChangeSet {
+        schema_version: CHANGESET_SCHEMA_VERSION,
         repo_root: ".".into(),
         base_ref: "HEAD".into(),
         head_ref: "work".into(),

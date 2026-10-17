@@ -2,8 +2,8 @@
 //! Minimal, dense, keyboard-first: Overview / Queue / Files / Diff / Escalate.
 
 use rift_core::{
-    Category, ChangeSet, ChangeStats, DiffLineKind, EscalationPackage, FileChange, ReviewItem,
-    Severity, SymbolChange, TaskCheck,
+    Category, CHANGESET_SCHEMA_VERSION, ChangeSet, ChangeStats, DiffLineKind, EscalationPackage,
+    FileChange, ReviewItem, Severity, SymbolChange, TaskCheck,
 };
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -143,6 +143,7 @@ impl RiftApp {
             ..Default::default()
         };
         let cs = ChangeSet {
+            schema_version: CHANGESET_SCHEMA_VERSION,
             repo_root,
             base_ref,
             head_ref,
@@ -1224,6 +1225,7 @@ mod tests {
 
     fn cs_with(items: Vec<ReviewItem>) -> ChangeSet {
         ChangeSet {
+            schema_version: CHANGESET_SCHEMA_VERSION,
             repo_root: ".".into(),
             base_ref: "HEAD".into(),
             head_ref: "worktree".into(),
